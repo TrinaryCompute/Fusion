@@ -107,7 +107,7 @@ import { PRIORITY_EXECUTE, type AgentSemaphore } from "./concurrency.js";
 // filter reuses the SAME always-allowed/scope-match surface as the non-workspace path (F5). One-way
 // executor→workspace-paths edge (workspace-paths imports nothing).
 import { deriveRepoScopeSubset, normalizeRepoRelPath } from "./workspace-paths.js";
-import { RemovalReason, classifyTaskWorktree, describeRegisteredWorktrees, detectNestedWorktreeRoot, getRegisteredWorktreePaths, isGitRepository, isInsideWorktreesDir, isRegisteredGitWorktree, removeWorktree, type WorktreePool } from "./worktree-pool.js";
+import { RemovalReason, classifyTaskWorktree, describeRegisteredWorktrees, detectGitRepository, detectNestedWorktreeRoot, getRegisteredWorktreePaths, isInsideWorktreesDir, isRegisteredGitWorktree, removeWorktree, type GitRepoDetection, type WorktreePool } from "./worktree-pool.js";
 import { attemptBranchAutocorrect } from "./branch-autocorrect.js";
 import { ActiveSessionWorktreeRemovalError } from "./worktree-backend.js";
 import {
@@ -948,6 +948,14 @@ function evaluatePromptDerivedNoCommitEligibility(task: Task, promptContent: str
 
 class NonRetryableWorktreeError extends Error {}
 
+function formatGitRepositoryDetectionError(rootDir: string, detection: Extract<GitRepoDetection, { status: "error" }>): string {
+  const stderr = detection.stderr.trim() || "git rev-parse --git-dir failed without stderr";
+  const remedy = detection.reason === "dubious-ownership"
+    ? ` Resolve Git safe-directory ownership with: git config --global --add safe.directory "${rootDir}"`
+    : "";
+  return `Git repository detection failed for project directory "${rootDir}". Fusion could not verify worktree support because git reported: ${stderr}.${remedy}`;
+}
+
 function buildSessionWorktreePathRegex(rootDir: string, settings: Partial<Settings>): RegExp {
   const configuredBase = resolveWorktreesDir(rootDir, settings).split(/[\\/]/).filter(Boolean).pop() ?? ".worktrees";
   const escapedBase = configuredBase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -1443,6 +1451,22 @@ Documents are versioned — each write creates a new revision. Use meaningful ke
 ## Artifact Registry
 
 Use \`fn_artifact_register\` to register multi-type artifacts for discovery across agents and tasks, \`fn_artifact_list\` to find registered artifacts by type/author/task/search, and \`fn_artifact_view\` to inspect artifact metadata plus inline content or URI references. Artifact registration sends a best-effort system inbox notification to the dashboard user; notification failures do not make registration fail.
+
+**IMPORTANT — Register visual and media deliverables as artifacts:** Whenever you produce a visual or media output — a screenshot of the app or a UI change, a wireframe, a design mockup, a diagram, a rendered chart, a before/after capture, a screen recording, an HTML prototype, or a PDF export — you MUST register it so it appears in the dashboard Artifacts gallery:
+
+1. Save the file to disk in your worktree (e.g. \`screenshots/after.png\`).
+2. Call \`fn_artifact_register(type="image", title="Settings modal — after fix", description="What this shows and why it matters", path="screenshots/after.png")\`.
+
+Relative paths resolve against your worktree, and the file is COPIED into managed storage — so register even files you do not commit, and register before the worktree is cleaned up. Artifacts you register are associated with this task automatically. Type cheat sheet:
+
+- **Images** (screenshots, wireframes, mockups, diagrams): \`type="image"\` with \`path\` — PNG, JPEG, GIF, WebP, or SVG.
+- **Videos** (screen recordings, demo reels): \`type="video"\` with \`path\` — MP4, WebM, or MOV. They play with seeking directly in the gallery.
+- **Audio**: \`type="audio"\` with \`path\` — MP3, WAV, or OGG.
+- **HTML mockups/prototypes**: \`type="document"\`, \`mimeType="text/html"\`, with inline \`content\` or \`path\` — they render as LIVE sandboxed web previews in the gallery, so a self-contained HTML file is a great way to deliver an interactive mock.
+- **PDFs** (spec exports, reports): \`type="document"\`, \`mimeType="application/pdf"\`, with \`path\` — they open in an embedded PDF viewer.
+- **Text/markdown deliverables**: \`type="document"\` with inline \`content\` — rendered as formatted markdown and editable by the user.
+
+Register visual evidence proactively for any UI-affecting task: capture at least one screenshot demonstrating the final result when the change has a visible surface. If the task asks for wireframes, mockups, designs, HTML prototypes, or recordings, the registered artifacts ARE the deliverable.
 
 **IMPORTANT — Save your deliverables as documents:** When your task produces written output (documentation, specifications, reports, API references, README updates, guides, or any other content), you MUST save that content as a task document using \`fn_task_document_write\`. Use a key that describes the deliverable (e.g., key="readme", key="api-docs", key="changelog"). Do this in addition to writing the file to disk — the document persists in the task for review even after the worktree is cleaned up.
 
@@ -2211,7 +2235,7 @@ export class TaskExecutor {
       this.store.setCompletionHandoffAcceptedMarker(task.id, {
         source: `executor:${reason}`,
       });
-      this.store.upsertMergeRequestRecord(task.id, {
+      await this.store.upsertMergeRequestRecord(task.id, {
         state: handedOff.autoMerge === false ? "manual-required" : "queued",
       });
     }
@@ -2234,7 +2258,8 @@ export class TaskExecutor {
 
   private get approvalRequestStore(): ApprovalRequestStore {
     if (!this._approvalRequestStore) {
-      this._approvalRequestStore = new ApprovalRequestStore(this.store.getDatabase());
+      const layer = this.store.getAsyncLayer();
+      this._approvalRequestStore = new ApprovalRequestStore(layer ? null : this.store.getDatabase(), { asyncLayer: layer });
     }
     return this._approvalRequestStore;
   }
@@ -2255,7 +2280,7 @@ export class TaskExecutor {
       taskId,
       runId: taskId ? this.getRunContextFor(taskId)?.runId : undefined,
       permissionPolicy: policy,
-      createApprovalRequest: async (decision, args) => this.approvalRequestStore.create({
+      createApprovalRequest: async (decision, args) => await this.approvalRequestStore.create({
         requester: {
           actorId,
           actorType: "agent",
@@ -2278,11 +2303,11 @@ export class TaskExecutor {
         },
       }),
       findApprovalByDedupeKey: async (dedupeKey) => {
-        const latest = this.approvalRequestStore.findLatestByDedupeKey({ requesterActorId: actorId, taskId, dedupeKey });
+        const latest = await this.approvalRequestStore.findLatestByDedupeKey({ requesterActorId: actorId, taskId, dedupeKey });
         return latest ? { id: latest.id, status: latest.status } : null;
       },
       findPendingApprovalByDedupeKey: async (dedupeKey) => {
-        const latest = this.approvalRequestStore.findLatestByDedupeKey({ requesterActorId: actorId, taskId, dedupeKey });
+        const latest = await this.approvalRequestStore.findLatestByDedupeKey({ requesterActorId: actorId, taskId, dedupeKey });
         return latest?.status === "pending" ? { id: latest.id } : null;
       },
       pauseForApproval: async ({ approvalRequestId, decision }) => {
@@ -2361,7 +2386,7 @@ export class TaskExecutor {
       // payload-bearing (shared helper) and `approvalDedupeKey`/`command`/`cwd`
       // are persisted into targetAction.context so findPendingApprovalRequest
       // can match and the UI can render the payload without re-parsing.
-      createApprovalRequest: async ({ category, toolName, args, approvalDedupeKey }) => this.approvalRequestStore.create({
+      createApprovalRequest: async ({ category, toolName, args, approvalDedupeKey }) => await this.approvalRequestStore.create({
         requester: {
           actorId,
           actorType: "agent",
@@ -2390,7 +2415,7 @@ export class TaskExecutor {
         },
       }),
       findPendingApprovalRequest: async (dedupeKey) => {
-        const pending = this.approvalRequestStore.list({ status: "pending", requesterActorId: actorId, taskId, limit: 100 });
+        const pending = await this.approvalRequestStore.list({ status: "pending", requesterActorId: actorId, taskId, limit: 100 });
         return pending.find((request) => request.targetAction.context?.approvalDedupeKey === dedupeKey) ?? null;
       },
     };
@@ -8091,9 +8116,10 @@ export class TaskExecutor {
     };
   }
 
-  private isLiveSharedBranchGroupMember(live: Pick<TaskDetail, "branchContext">): boolean {
+  private async isLiveSharedBranchGroupMember(live: Pick<TaskDetail, "branchContext">): Promise<boolean> {
     const groupId = live.branchContext?.groupId?.trim();
-    const branchGroup = groupId ? this.store.getBranchGroup(groupId) : null;
+    // FNXC:PostgresCutover 2026-07-10: getBranchGroup is async on the PG branch.
+    const branchGroup = groupId ? await this.store.getBranchGroup(groupId) : null;
     return isLiveSharedBranchGroupMemberIntegration(live, branchGroup);
   }
 
@@ -8113,7 +8139,7 @@ export class TaskExecutor {
     const settings = await this.store.getSettings().catch(() => undefined);
     if (!settings || settings.globalPause === true || settings.enginePaused === true) return false;
     /* FNXC:AutoMergeHold 2026-07-09-17:04: FN-7750 requires retryable pre-merge remediation to treat stale shared-group members as standalone manual-hold rows when global auto-merge is off; only live/open groups retain the shared-member exemption. */
-    if (!allowsAutoMergeProcessing(live, settings) && !this.isLiveSharedBranchGroupMember(live)) return false;
+    if (!allowsAutoMergeProcessing(live, settings) && !(await this.isLiveSharedBranchGroupMember(live))) return false;
     const target = this.latestFailedPreMergeWorkflowStep(live);
     if (!target) return false;
     const budget = await this.resolveFailedPreMergeWorkflowStepBudget(live, target);
@@ -8167,7 +8193,7 @@ export class TaskExecutor {
     } catch {
       return false;
     }
-    const sharedBranchMember = this.isLiveSharedBranchGroupMember(live);
+    const sharedBranchMember = await this.isLiveSharedBranchGroupMember(live);
     if (!sharedBranchMember && !allowsAutoMergeProcessing(live, settings)) return false;
     if (!sharedBranchMember && resolveEffectiveAutoMerge(live, settings) === false) return false;
     if ((live.mergeRetries ?? 0) >= resolveMaxAutoMergeRetries(settings)) return false;
@@ -8236,7 +8262,7 @@ export class TaskExecutor {
       return false;
     }
     /* FNXC:AutoMergeHold 2026-07-09-17:07: FN-7749's benign manual-hold classifier must exclude only live shared-group integrations. FN-7750 stale shared-group members are standalone manual-hold rows and should not be stranded as pause-abort failures. */
-    if (this.isLiveSharedBranchGroupMember(live)) return false;
+    if (await this.isLiveSharedBranchGroupMember(live)) return false;
     return !allowsAutoMergeProcessing(live, settings) || resolveEffectiveAutoMerge(live, settings) === false;
   }
 
@@ -8277,7 +8303,7 @@ export class TaskExecutor {
       return false;
     }
     if (settings.globalPause === true || settings.enginePaused === true) return false;
-    if (!allowsAutoMergeProcessing(live, settings) && !this.isLiveSharedBranchGroupMember(live)) return false;
+    if (!allowsAutoMergeProcessing(live, settings) && !(await this.isLiveSharedBranchGroupMember(live))) return false;
 
     this.clearPausedAborted(live.id);
     this.activeWorktrees.delete(live.id);
@@ -8350,7 +8376,7 @@ export class TaskExecutor {
       return false;
     }
     if (settings.globalPause === true || settings.enginePaused === true) return false;
-    if (!allowsAutoMergeProcessing(live, settings) && !this.isLiveSharedBranchGroupMember(live)) return false;
+    if (!allowsAutoMergeProcessing(live, settings) && !(await this.isLiveSharedBranchGroupMember(live))) return false;
 
     const nextRetries = priorRetries + 1;
     this.clearPausedAborted(live.id);
@@ -8456,7 +8482,7 @@ export class TaskExecutor {
     if (live.column === "in-review") {
       if (live.autoMerge === false) return false;
       if (!settings) return false;
-      const sharedBranchMember = this.isLiveSharedBranchGroupMember(live);
+      const sharedBranchMember = await this.isLiveSharedBranchGroupMember(live);
       if (!sharedBranchMember && !allowsAutoMergeProcessing(live, settings)) return false;
       if (live.mergeDetails?.mergeConfirmed === true) return false;
     }
@@ -9231,7 +9257,7 @@ export class TaskExecutor {
     const markerAcceptedByTaskId = new Map<string, boolean>();
     if (settings.mergeRequestContractShadowEnabled === true) {
       for (const depId of liveTask.dependencies) {
-        markerAcceptedByTaskId.set(depId, this.store.getCompletionHandoffAcceptedMarker(depId) !== null);
+        markerAcceptedByTaskId.set(depId, (await this.store.getCompletionHandoffAcceptedMarker(depId)) !== null);
       }
     }
     const unmetDeps = getUnmetSchedulingDependencies(
@@ -9526,14 +9552,26 @@ export class TaskExecutor {
       and enable a workspace with nothing to work on. Gate every workspace check on repos.length > 0.
       */
       const hasWorkspaceRepos = (this.workspaceConfig?.repos.length ?? 0) > 0;
-      if (!hasWorkspaceRepos && !await isGitRepository(this.rootDir)) {
-        await this.store.logEntry(
-          task.id,
-          "Cannot execute task: project directory is not a Git repository. Fusion requires a Git repository for worktree-based task execution.",
-        );
-        throw new Error(
-          "Project directory is not a Git repository. Fusion requires a Git repository for worktree creation. Initialize with 'git init' or run from a Git project directory.",
-        );
+      if (!hasWorkspaceRepos) {
+        const gitDetection = await detectGitRepository(this.rootDir);
+        if (gitDetection.status === "not-repo") {
+          await this.store.logEntry(
+            task.id,
+            "Cannot execute task: project directory is not a Git repository. Fusion requires a Git repository for worktree-based task execution.",
+          );
+          throw new Error(
+            "Project directory is not a Git repository. Fusion requires a Git repository for worktree creation. Initialize with 'git init' or run from a Git project directory.",
+          );
+        }
+        if (gitDetection.status === "error") {
+          /*
+          FNXC:Worktree 2026-07-10-00:00:
+          FN-7799 requires environmental Git probe failures in valid repos to surface the real cause instead of telling operators to run `git init`. Dubious ownership and similar persistent failures otherwise block every task across restarts with a false non-repo diagnosis.
+          */
+          const message = formatGitRepositoryDetectionError(this.rootDir, gitDetection);
+          await this.store.logEntry(task.id, message);
+          throw new Error(message);
+        }
       }
 
       const hadAssignedWorktree = Boolean(task.worktree);
@@ -10489,12 +10527,16 @@ export class TaskExecutor {
         this.createTaskDocumentReadTool(task.id),
         // FNXC:FileScope 2026-07-08-22:40: let the coding agent extend its own declared ## File Scope at runtime (fn_task_file_scope_add) so edits beyond the initial scope are not stranded by the scope-aware squash merge.
         this.createTaskFileScopeAddTool(task.id),
-        // FNXC:ArtifactRegistry 2026-06-21-07:04: Artifact list/view are read-only discovery tools and must remain available even when the task has no assigned agent identity; only registration requires an authorId for persisted attribution and best-effort inbox notification.
         this.createArtifactListTool(),
         this.createArtifactViewTool(),
-        ...(assignedAgentId ? [
-          this.createArtifactRegisterTool(assignedAgentId),
-        ] : []),
+        /*
+        FNXC:ArtifactRegistry 2026-07-10-14:30:
+        fn_artifact_register was previously gated on assignedAgentId, but default ephemeral mode never
+        sets assignedAgentId on in-progress tasks — so executor agents never had the register tool at
+        all and agent-produced screenshots/wireframes could not reach the Artifacts gallery. Always
+        expose it, attributing ephemeral runs to the established "executor" fallback author.
+        */
+        this.createArtifactRegisterTool(assignedAgentId ?? "executor", task.id, worktreePath),
         this.createWorkflowListTool(),
         this.createWorkflowGetTool(),
         this.createWorkflowSelectTool(task.id),
@@ -12514,8 +12556,17 @@ export class TaskExecutor {
     return sharedCreateTaskFileScopeAddTool(this.store, taskId, this.getRunContextFor(taskId));
   }
 
-  private createArtifactRegisterTool(authorId: string): ToolDefinition {
-    return sharedCreateArtifactRegisterTool(this.store, authorId, this.options.messageStore);
+  /*
+  FNXC:ArtifactRegistry 2026-07-10-14:30:
+  Executor-lane registration anchors relative `path` payloads at the task worktree (where the agent
+  saves screenshots/wireframes/mocks) and defaults taskId to the executing task so agent-produced
+  media surfaces in the per-task Artifacts tab without the agent having to repeat its own task id.
+  */
+  private createArtifactRegisterTool(authorId: string, taskId: string, worktreePath: string): ToolDefinition {
+    return sharedCreateArtifactRegisterTool(this.store, authorId, this.options.messageStore, {
+      baseDir: worktreePath,
+      defaultTaskId: taskId,
+    });
   }
 
   private createArtifactListTool(): ToolDefinition {

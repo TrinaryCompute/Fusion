@@ -44,6 +44,7 @@ import { TaskReviewTab } from "./TaskReviewTab";
 import { MergeDetails } from "./MergeDetails";
 import { TaskChangesTab } from "./TaskChangesTab";
 import { TaskSummaryTab } from "./TaskSummaryTab";
+import { TaskCostTab } from "./TaskCostTab";
 import { WorkspaceWorktreesSummary, isWorkspaceTask } from "./WorkspaceWorktreesSummary";
 import { TaskForm, type PendingImage } from "./TaskForm";
 import { useNodes } from "../hooks/useNodes";
@@ -226,7 +227,7 @@ function formatDurationCompact(ageMs: number): string {
   return `${minutes}m`;
 }
 
-type TabId = "summary" | "definition" | "chat" | "planner-chat" | "logs" | "changes" | "review" | "pr" | "comments" | "model" | "workflow" | "documents" | "stats" | "routing" | "retries" | "terminal" | `plugin-${string}`;
+type TabId = "summary" | "cost" | "definition" | "chat" | "planner-chat" | "logs" | "changes" | "review" | "pr" | "comments" | "model" | "workflow" | "documents" | "stats" | "routing" | "retries" | "terminal" | "worktree-terminal" | `plugin-${string}`;
 type ActivitySegment = "current" | "feed" | "raw-logs" | "interventions";
 
 /*
@@ -271,9 +272,12 @@ function resolveDefaultActivitySegment(initialTab: TabId | undefined): ActivityS
   return initialTab === "logs" ? "feed" : "current";
 }
 
-// Lazy-load the terminal so xterm + addons stay out of the main bundle (U11).
+// Lazy-load terminal surfaces so xterm + addons stay out of the main bundle (U11).
 const LazySessionTerminal = lazy(() =>
   import("./SessionTerminal").then((m) => ({ default: m.SessionTerminal })),
+);
+const LazyTerminalModal = lazy(() =>
+  import("./TerminalModal").then((m) => ({ default: m.TerminalModal })),
 );
 
 /** CLI session record fields the terminal tab needs (mirrors @fusion/core CliSession). */
@@ -1153,6 +1157,12 @@ export function TaskDetailContent({
     [cliSession, cliOneShot, cliGenericIdle],
   );
   const showCliTab = cliTabVisibility.kind !== "hidden";
+  /*
+  FNXC:TaskDetailTerminal 2026-07-11-13:20:
+  FN-7826 makes the interactive Terminal tab always available in Task Detail. The first shell opens in task.worktree when present; otherwise defaultCwd stays undefined so useTerminalSessions creates a project-root shell, including for multi-repo workspace tasks with no single worktree. Terminal sessions remain task-scoped through scopeId so they do not share the footer/global terminal namespace.
+  */
+  const taskWorktreeCwd = typeof task.worktree === "string" && task.worktree.trim().length > 0 ? task.worktree : undefined;
+  const showWorktreeTerminalTab = true;
   const cliPosture: SessionTerminalPosture | undefined = useMemo(() => {
     if (!cliSession) return undefined;
     const p = cliSession.autonomyPosture ?? {};
@@ -1186,6 +1196,7 @@ export function TaskDetailContent({
   useEffect(() => {
     if (activeTab === "terminal" && !showCliTab) setActiveTab("definition");
   }, [activeTab, showCliTab]);
+
 
   // Track mount state to avoid setting state on unmounted component
   useEffect(() => {
@@ -4369,6 +4380,13 @@ export function TaskDetailContent({
                 {t("taskDetail.tabs.summary", "Summary")}
               </button>
             )}
+            {/* FNXC:TaskDetailCost 2026-07-11-12:10: The Cost tab is always reachable (unlike done-only Summary) because operators need read-time model spend visibility while work is still in progress; it reuses costFor via the shared taskTokenCost helper and never persists derived USD. */}
+            <button
+              className={`detail-tab${activeTab === "cost" ? " detail-tab-active" : ""}`}
+              onClick={() => setActiveTab("cost")}
+            >
+              {t("taskDetail.tabs.cost", "Cost")}
+            </button>
             <button
               className={`detail-tab${activeTab === "definition" ? " detail-tab-active" : ""}`}
               onClick={() => setActiveTab("definition")}
@@ -4439,7 +4457,15 @@ export function TaskDetailContent({
                 className={`detail-tab${activeTab === "terminal" ? " detail-tab-active" : ""}`}
                 onClick={() => setActiveTab("terminal")}
               >
-                {t("taskDetail.tabs.terminal", "Terminal")}
+                {t("taskDetail.tabs.terminal", "Session")}
+              </button>
+            )}
+            {showWorktreeTerminalTab && (
+              <button
+                className={`detail-tab${activeTab === "worktree-terminal" ? " detail-tab-active" : ""}`}
+                onClick={() => setActiveTab("worktree-terminal")}
+              >
+                {t("taskDetail.tabs.worktreeTerminal", "Terminal")}
               </button>
             )}
             {/* Plugin tabs */}
@@ -4496,6 +4522,10 @@ export function TaskDetailContent({
           ) : activeTab === "summary" && task.column === "done" ? (
             <div className="detail-section detail-section--summary">
               <TaskSummaryTab task={workingTask} pricingOverrides={globalSettings?.modelPricingOverrides} />
+            </div>
+          ) : activeTab === "cost" ? (
+            <div className="detail-section detail-section--cost">
+              <TaskCostTab task={workingTask} pricingOverrides={globalSettings?.modelPricingOverrides} />
             </div>
           ) : activeTab === "planner-chat" ? (
             <div className="detail-section detail-section--planner-chat">
@@ -4823,6 +4853,19 @@ export function TaskDetailContent({
                   />
                 </Suspense>
               ) : null}
+            </div>
+          ) : activeTab === "worktree-terminal" && showWorktreeTerminalTab ? (
+            <div className="detail-section detail-section--worktree-terminal">
+              <Suspense fallback={<div className="detail-loading"><LoadingSpinner label={t("taskDetail.terminal.loadingInteractive", "Loading interactive terminal…")} /></div>}>
+                <LazyTerminalModal
+                  isOpen={true}
+                  onClose={() => setActiveTab("definition")}
+                  embedded
+                  defaultCwd={taskWorktreeCwd}
+                  scopeId={task.id}
+                  projectId={projectId}
+                />
+              </Suspense>
             </div>
           ) : (
           <>

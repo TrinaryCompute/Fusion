@@ -7,13 +7,14 @@
  * The parameter schemas are canonical here — executor.ts imports and reuses them.
  */
 
-import { appendFile, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, readdir, realpath, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { join, relative, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import * as fusionCore from "@fusion/core";
 import type { AgentState, AgentCapability, AgentUpdateInput, Artifact, ArtifactCreateInput, ArtifactWithTask, TaskDocument, TaskDocumentCreateInput, TaskStore, RunMutationContext, MessageStore, Message, SourceType, Settings, ResearchRun, ResearchRunStatus, TaskCreateInput, ReflectionStore, ApprovalRequestStore, ProjectSettings, ChatStore, WorkflowSettingDefinition, GoalStatus } from "@fusion/core";
-import { listTraits, isBuiltinWorkflowId, AgentStore, validateColumnAgentBindings, ColumnAgentBindingError, stripApprovalBypassFlags, WorkflowSettingRejectionError, resolveEffectiveSettingsById, resolveWorkflowIrById, findOrphanedSettingValues, BUILTIN_WORKFLOW_SETTINGS, MAX_TASK_LIST_TEXT_CHARS, formatCurrentTaskLine, normalizeWorkflowIcon } from "@fusion/core";
+import { listTraits, isBuiltinWorkflowId, AgentStore, validateColumnAgentBindings, ColumnAgentBindingError, ResearchStore, stripApprovalBypassFlags, WorkflowSettingRejectionError, resolveEffectiveSettingsById, resolveWorkflowIrById, findOrphanedSettingValues, BUILTIN_WORKFLOW_SETTINGS, MAX_TASK_LIST_TEXT_CHARS, formatCurrentTaskLine, normalizeWorkflowIcon } from "@fusion/core";
 import { promoteHeldTask } from "./hold-release.js";
 import { DASHBOARD_USER_ID, canAgentTakeImplementationTaskForExplicitRouting, dailyMemoryPath, ensureOpenClawMemoryFiles, extractAgentProvisioningRequest, formatRoleMismatchReason, getMemoryBackendCapabilities, getProjectMemory, isEphemeralAgent, memoryLongTermPath, normalizeMessageParticipant, reconcileDeterministicDuplicate, resolveAgentProvisioningPolicy, resolveMemoryBackend, resolveResearchSettings, resolveTaskGithubTracking, runDeterministicDuplicateGuard, scheduleQmdProjectMemoryRefresh, searchProjectMemory, shouldSkipBackgroundQmdRefresh } from "@fusion/core";
 import { ResearchOrchestrator } from "./research-orchestrator.js";
@@ -140,7 +141,8 @@ export const artifactRegisterParams = Type.Object({
   mimeType: Type.Optional(Type.String({ description: "Optional MIME type, e.g. text/markdown or image/png." })),
   uri: Type.Optional(Type.String({ description: "Optional URI/path reference when content is stored elsewhere." })),
   content: Type.Optional(Type.String({ description: "Optional inline text content for document/text artifacts." })),
-  dataBase64: Type.Optional(Type.String({ description: "Optional base64-encoded binary payload for image artifacts, e.g. PNG bytes; omit content and uri when provided." })),
+  dataBase64: Type.Optional(Type.String({ description: "Optional base64-encoded binary payload for image artifacts, e.g. PNG bytes; omit content, uri, and path when provided." })),
+  path: Type.Optional(Type.String({ description: "Optional local file path to a media file you already saved (screenshot, wireframe, mockup, recording). The file is copied into managed artifact storage. Preferred over dataBase64 for files on disk. Omit content, uri, and dataBase64 when provided." })),
   taskId: Type.Optional(Type.String({ description: "Optional associated task ID (e.g. 'FN-001')." })),
 });
 
@@ -164,7 +166,8 @@ export const chatArtifactRegisterParams = Type.Object({
   mimeType: Type.Optional(Type.String({ description: "Optional MIME type, e.g. text/markdown or image/png." })),
   uri: Type.Optional(Type.String({ description: "Optional URI/path reference when content is stored elsewhere." })),
   content: Type.Optional(Type.String({ description: "Optional inline text content for document/text artifacts." })),
-  dataBase64: Type.Optional(Type.String({ description: "Optional base64-encoded binary payload for image artifacts, e.g. PNG bytes; omit content and uri when provided." })),
+  dataBase64: Type.Optional(Type.String({ description: "Optional base64-encoded binary payload for image artifacts, e.g. PNG bytes; omit content, uri, and path when provided." })),
+  path: Type.Optional(Type.String({ description: "Optional local file path to a media file you already saved (screenshot, wireframe, mockup, recording). The file is copied into managed artifact storage. Preferred over dataBase64 for files on disk. Omit content, uri, and dataBase64 when provided." })),
   task_id: Type.String({ description: "Associated task ID (e.g. 'FN-001')." }),
 });
 
@@ -1509,15 +1512,22 @@ export function createChatTaskDocumentTools(store: TaskStore): ToolDefinition[] 
  * FNXC:ArtifactRegistry 2026-06-21-06:50:
  * Agents need to register multi-type artifacts across agents and tasks while using the existing task store registry. A new artifact registration must also announce itself to the dashboard user's inbox, but that notification is best-effort and must never fail the artifact write.
  */
-export function createArtifactRegisterTool(store: TaskStore, authorId: string, messageStore?: MessageStore): ToolDefinition {
+export function createArtifactRegisterTool(
+  store: TaskStore,
+  authorId: string,
+  messageStore?: MessageStore,
+  options?: ArtifactRegisterToolOptions,
+): ToolDefinition {
   return {
     name: "fn_artifact_register",
     label: "Register Artifact",
     description:
-      "Register an artifact (document, image, video, audio, or other) so other agents and tasks can discover it. " +
-      "Provide inline content, a uri/path reference, or dataBase64 image bytes; optionally associate it with a taskId.",
+      "Register an artifact (document, image, video, audio, or other) so it appears in the dashboard Artifacts gallery and other agents and tasks can discover it. " +
+      "For media you saved to disk (screenshots, wireframes, mockups, screen recordings, PDFs), pass `path` — the file is copied into managed artifact storage. " +
+      "HTML mockups (type=document, mimeType=text/html, content or path) render as live sandboxed previews; PDFs (mimeType=application/pdf, path) open in an embedded viewer; videos play with seeking. " +
+      "Alternatively provide inline `content` for text/markdown/HTML documents or `dataBase64` image bytes; optionally associate the artifact with a taskId.",
     parameters: artifactRegisterParams,
-    execute: async (_id: string, params: Static<typeof artifactRegisterParams>) => registerArtifactForAgent(store, authorId, params, messageStore),
+    execute: async (_id: string, params: Static<typeof artifactRegisterParams>) => registerArtifactForAgent(store, authorId, params, messageStore, options),
   };
 }
 
@@ -1562,7 +1572,7 @@ export function createChatArtifactTools(store: TaskStore, messageStore?: Message
       name: "fn_artifact_register",
       label: "Register Artifact",
       description:
-        "Register an artifact for a specific task so other agents can discover it. Requires task_id, accepts dataBase64 image bytes, and notifies the dashboard inbox best-effort.",
+        "Register an artifact for a specific task so it appears in the dashboard Artifacts gallery and other agents can discover it. Requires task_id; accepts a local file `path` (screenshots, wireframes, mockups, recordings, PDFs), inline `content` (text/markdown/HTML — HTML renders as a live preview), or dataBase64 image bytes, and notifies the dashboard inbox best-effort.",
       parameters: chatArtifactRegisterParams,
       execute: async (_id: string, params: Static<typeof chatArtifactRegisterParams>) => registerArtifactForAgent(
         store,
@@ -1575,6 +1585,7 @@ export function createChatArtifactTools(store: TaskStore, messageStore?: Message
           uri: params.uri,
           content: params.content,
           dataBase64: params.dataBase64,
+          path: params.path,
           taskId: params.task_id,
         },
         messageStore,
@@ -1599,29 +1610,53 @@ export function createChatArtifactTools(store: TaskStore, messageStore?: Message
   ];
 }
 
+/**
+ * FNXC:ArtifactRegistry 2026-07-10-14:30:
+ * Executor-lane artifact registration must default to the executing task so agent-produced media
+ * lands in the per-task Artifacts tab (and gallery task context) even when the agent omits taskId.
+ * `baseDir` anchors relative `path` payloads at the agent's worktree so "screenshots/after.png"
+ * resolves where the agent actually saved it.
+ */
+export interface ArtifactRegisterToolOptions {
+  baseDir?: string;
+  defaultTaskId?: string;
+}
+
 async function registerArtifactForAgent(
   store: TaskStore,
   authorId: string,
   params: Static<typeof artifactRegisterParams>,
   messageStore?: MessageStore,
+  options?: ArtifactRegisterToolOptions,
 ) {
   try {
-    const data = decodeArtifactDataBase64(params);
+    /*
+    FNXC:ArtifactRegistry 2026-07-11-09:40:
+    docs/agents.md promises "exactly one payload source" for fn_artifact_register. The path and
+    dataBase64 readers already reject their own mixed combos with specific messages; this guard
+    closes the remaining content+uri gap so both fields are never persisted on one artifact row.
+    Zero payload sources stays allowed (metadata-only registrations are unchanged).
+    */
+    if (params.content !== undefined && params.uri !== undefined) {
+      throw new Error("content cannot be combined with uri; provide exactly one artifact payload source: content, uri, dataBase64, or path.");
+    }
+    const filePayload = await readArtifactFileFromPath(params, options?.baseDir);
+    const data = filePayload ? filePayload.data : decodeArtifactDataBase64(params);
     const input: ArtifactCreateInput = {
       type: params.type,
       title: params.title,
       description: params.description,
-      mimeType: params.mimeType,
+      mimeType: filePayload?.mimeType ?? params.mimeType,
       uri: params.uri,
       content: params.content,
       data,
       authorId,
       authorType: "agent",
-      taskId: params.taskId,
+      taskId: params.taskId ?? options?.defaultTaskId,
     };
 
     const artifact: Artifact = await store.registerArtifact(input);
-    notifyArtifactRegistered(messageStore, artifact, authorId);
+    void notifyArtifactRegistered(messageStore, artifact, authorId);
     return {
       content: [{
         type: "text" as const,
@@ -1640,7 +1675,6 @@ async function registerArtifactForAgent(
     };
   }
 }
-
 /**
  * FNXC:ArtifactRegistry 2026-06-29-00:00:
  * Agents need a portable way to create task-scoped image artifacts without reading arbitrary local files. `dataBase64` decodes inside the tool and then uses TaskStore's existing binary persistence path so registry rows continue to store only managed artifact URIs.
@@ -1648,6 +1682,177 @@ async function registerArtifactForAgent(
  * FNXC:ArtifactRegistry 2026-06-29-17:05:
  * `dataBase64` is an image-only payload source. Reject empty, non-image, and signature-mismatched bytes early so agents get actionable tool errors instead of persisting artifacts the dashboard cannot preview.
  */
+/*
+FNXC:ArtifactRegistry 2026-07-10-14:30:
+Agents produce screenshots/wireframes/mockups as files on disk (browser tools, design tooling, ffmpeg), and inlining megabytes of base64 into a tool call is impractical — which is why image artifacts were effectively never created. `path` lets the agent register the file it already saved; the bytes are read here and persisted through TaskStore's managed artifact storage so the registry row keeps a servable managed URI even after the worktree is cleaned up.
+Image payloads are signature-validated (PNG/JPEG/GIF/WebP binary magic, SVG text sniff) so the dashboard gallery never receives an unpreviewable "image". Non-image media (video/audio/other/document files) only require a resolvable MIME type, inferred from the file extension when omitted.
+*/
+const ARTIFACT_FILE_MAX_BYTES = 50 * 1024 * 1024;
+
+const ARTIFACT_EXTENSION_MIME_TYPES: Record<string, string> = {
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".svg": "image/svg+xml",
+  ".mp4": "video/mp4",
+  ".webm": "video/webm",
+  ".mov": "video/quicktime",
+  ".mp3": "audio/mpeg",
+  ".wav": "audio/wav",
+  ".ogg": "audio/ogg",
+  ".pdf": "application/pdf",
+  ".html": "text/html",
+  ".md": "text/markdown",
+  ".txt": "text/plain",
+  ".json": "application/json",
+};
+
+async function readArtifactFileFromPath(
+  params: Static<typeof artifactRegisterParams>,
+  baseDir?: string,
+): Promise<{ data: Buffer; mimeType: string } | undefined> {
+  if (params.path === undefined) {
+    return undefined;
+  }
+
+  const rawPath = params.path.trim();
+  if (rawPath.length === 0) {
+    throw new Error("path must reference a file on disk.");
+  }
+
+  if (params.uri || params.content || params.dataBase64) {
+    throw new Error("path cannot be combined with uri, content, or dataBase64; provide exactly one artifact payload source.");
+  }
+
+  /*
+  FNXC:ArtifactRegistry 2026-07-11-09:45:
+  `path` reads server-side files, so it must be contained: an injected tool call must not be able to
+  copy arbitrary readable server files (e.g. secrets, /etc files) into managed artifact storage.
+  Containment rule (checked BEFORE stat/readFile, on realpath-canonicalized paths so symlinks and
+  `../` segments cannot escape; macOS tmpdir /var/folders/... canonicalizes to /private/var/...):
+  - Relative paths REQUIRE a configured session `baseDir` (executor/heartbeat worktree) and must
+    canonicalize to inside it; without a baseDir they are rejected instead of silently resolving
+    against process.cwd() (the server process directory).
+  - Absolute paths are allowed only inside the canonical `baseDir` or the canonical OS temp
+    directory. The tmpdir allowance is deliberate: browser/screenshot/recording tooling writes
+    captures under os.tmpdir(), and agents must be able to register those from every lane.
+  - Lanes without a baseDir (dashboard chat, no-baseDir heartbeats) are therefore bounded to
+    tmpdir-only absolute paths.
+  */
+  const isRelative = !isAbsolute(rawPath);
+  if (isRelative && !baseDir) {
+    throw new Error("relative path requires a workspace directory for this session; pass an absolute path under the OS temp directory instead.");
+  }
+  const resolvedPath = isRelative ? resolve(baseDir!, rawPath) : rawPath;
+
+  let canonicalPath: string;
+  try {
+    canonicalPath = await realpath(resolvedPath);
+  } catch {
+    throw new Error(`path ${resolvedPath} does not exist or is not readable.`);
+  }
+
+  let canonicalBaseDir: string | undefined;
+  if (baseDir) {
+    try {
+      canonicalBaseDir = await realpath(baseDir);
+    } catch {
+      canonicalBaseDir = undefined;
+    }
+  }
+  const canonicalTmpDir = await realpath(tmpdir());
+  const isInside = (child: string, root: string): boolean => child === root || child.startsWith(root.endsWith(sep) ? root : root + sep);
+
+  if (isRelative) {
+    if (!canonicalBaseDir || !isInside(canonicalPath, canonicalBaseDir)) {
+      throw new Error(`path ${rawPath} escapes the session workspace directory ${baseDir}; relative artifact paths must stay inside it.`);
+    }
+  } else if (!(canonicalBaseDir && isInside(canonicalPath, canonicalBaseDir)) && !isInside(canonicalPath, canonicalTmpDir)) {
+    const allowedRoots = [canonicalBaseDir, canonicalTmpDir].filter(Boolean).join(", ");
+    throw new Error(`path ${resolvedPath} is outside the allowed roots (${allowedRoots}); artifact files must live under the session workspace directory or the OS temp directory.`);
+  }
+
+  let fileStat;
+  try {
+    fileStat = await stat(canonicalPath);
+  } catch {
+    throw new Error(`path ${resolvedPath} does not exist or is not readable.`);
+  }
+
+  if (!fileStat.isFile()) {
+    throw new Error(`path ${resolvedPath} is not a regular file.`);
+  }
+
+  if (fileStat.size === 0) {
+    throw new Error(`path ${resolvedPath} is empty.`);
+  }
+
+  if (fileStat.size > ARTIFACT_FILE_MAX_BYTES) {
+    throw new Error(`path ${resolvedPath} is ${fileStat.size} bytes, above the ${ARTIFACT_FILE_MAX_BYTES}-byte artifact limit.`);
+  }
+
+  const inferredMime = ARTIFACT_EXTENSION_MIME_TYPES[extname(resolvedPath).toLowerCase()];
+  const mimeType = params.mimeType?.toLowerCase().split(";", 1)[0] ?? inferredMime;
+  if (!mimeType) {
+    throw new Error(`Could not infer a MIME type from ${resolvedPath}; pass mimeType explicitly.`);
+  }
+
+  const data = await readFile(canonicalPath);
+
+  if (params.type === "image") {
+    if (!mimeType.startsWith("image/")) {
+      throw new Error(`image artifacts require an image/* mimeType, got ${mimeType}.`);
+    }
+    if (!isValidImagePayload(data, mimeType)) {
+      throw new Error(`path ${resolvedPath} does not contain valid image bytes matching mimeType ${mimeType}.`);
+    }
+  }
+
+  /*
+  FNXC:ArtifactRegistry 2026-07-11-10:20:
+  Video and PDF payloads get the same keep-the-gallery-playable treatment as images: a light
+  container-signature check (mp4/mov ftyp box, WebM EBML header, %PDF- prefix) rejects renamed
+  junk before it reaches the registry, where the dashboard viewer could not play or render it.
+  */
+  if (params.type === "video") {
+    if (!mimeType.startsWith("video/")) {
+      throw new Error(`video artifacts require a video/* mimeType, got ${mimeType}.`);
+    }
+    if (!hasVideoSignature(data, mimeType)) {
+      throw new Error(`path ${resolvedPath} does not contain valid video bytes matching mimeType ${mimeType}.`);
+    }
+  }
+
+  if (mimeType === "application/pdf" && !data.subarray(0, 5).equals(Buffer.from("%PDF-"))) {
+    throw new Error(`path ${resolvedPath} does not contain valid PDF bytes (missing %PDF- header).`);
+  }
+
+  return { data, mimeType };
+}
+
+function hasVideoSignature(data: Buffer, mimeType: string): boolean {
+  if (mimeType === "video/webm") {
+    // EBML header shared by WebM/Matroska containers.
+    return data.subarray(0, 4).equals(Buffer.from("1a45dfa3", "hex"));
+  }
+  if (mimeType === "video/mp4" || mimeType === "video/quicktime") {
+    // ISO BMFF: box size (4 bytes) then "ftyp".
+    return data.length >= 8 && data.subarray(4, 8).toString("ascii") === "ftyp";
+  }
+  // Unknown video containers pass; the mimeType prefix check already ran.
+  return true;
+}
+
+function isValidImagePayload(data: Buffer, mimeType: string): boolean {
+  if (mimeType === "image/svg+xml") {
+    const head = data.subarray(0, 4096).toString("utf8").trimStart();
+    return head.startsWith("<svg") || (head.startsWith("<?xml") && head.includes("<svg"));
+  }
+  return hasImageSignature(data, mimeType);
+}
+
 function decodeArtifactDataBase64(params: Static<typeof artifactRegisterParams>): Buffer | undefined {
   if (params.dataBase64 === undefined) {
     return undefined;
@@ -1708,11 +1913,11 @@ function hasImageSignature(data: Buffer, mimeType: string): boolean {
   return false;
 }
 
-function notifyArtifactRegistered(messageStore: MessageStore | undefined, artifact: Artifact, authorId: string): void {
+async function notifyArtifactRegistered(messageStore: MessageStore | undefined, artifact: Artifact, authorId: string): Promise<void> {
   if (!messageStore) return;
 
   try {
-    messageStore.sendMessage({
+    await messageStore.sendMessage({
       fromType: "system",
       toType: "user",
       toId: DASHBOARD_USER_ID,
@@ -2084,7 +2289,13 @@ async function assertWorkflowColumnAgentBindings(
 ): Promise<void> {
   const columns = (ir as { columns?: unknown })?.columns;
   if (!Array.isArray(columns) || !columns.some((c) => c?.agent?.agentId)) return;
-  const agentStore = new AgentStore({ rootDir: store.getFusionDir() });
+  // FNXC:SqliteFinalRemoval 2026-06-26-11:05:
+  // In backend mode, pass the AsyncDataLayer so AgentStore delegates to async helpers.
+  const agentLayer = store.getAsyncLayer();
+  const agentStore = new AgentStore({
+    rootDir: store.getFusionDir(),
+    ...(agentLayer ? { asyncLayer: agentLayer } : {}),
+  });
   await agentStore.init();
   const settings = await store.getSettings();
   await validateColumnAgentBindings({ ir, agentStore, settings, confirmPolicyEscalation });
@@ -2797,8 +3008,8 @@ export function createGoalListTool(
     execute: async (_id: string, params: Static<typeof goalListParams>, _signal, _onUpdate, ctx) => {
       const goalStore = store.getGoalStore();
       const status = params.status ?? "active";
-      const goals = status === "all" ? goalStore.listGoals() : goalStore.listGoals({ status });
-      const activeCount = goalStore.listGoals({ status: "active" }).length;
+      const goals = status === "all" ? await goalStore.listGoals() : await goalStore.listGoals({ status });
+      const activeCount = (await goalStore.listGoals({ status: "active" })).length;
       const softWarning = activeCount >= GOAL_LIST_SOFT_WARNING_THRESHOLD;
       const goalEntries = goals.map(buildGoalListDetailsEntry);
 
@@ -2850,7 +3061,7 @@ export function createGoalShowTool(
     parameters: goalShowParams,
     execute: async (_id: string, params: Static<typeof goalShowParams>, _signal, _onUpdate, ctx) => {
       const goalStore = store.getGoalStore();
-      const goal = goalStore.getGoal(params.id);
+      const goal = await goalStore.getGoal(params.id);
       const auditContext = resolveGoalAuditContext(ctx, options?.runContext, options?.taskId);
 
       if (!goal) {
@@ -3403,7 +3614,7 @@ export function createAgentCreateTool(
           operation: `create:${params.name}:${params.role}:${reportsTo}`,
         });
 
-        const request = options.approvalRequestStore.create({
+        const request = await options.approvalRequestStore.create({
           requester: { actorId: callingAgentId, actorType: "agent", actorName: caller?.name ?? callingAgentId },
           targetAction: {
             category: "agent_provisioning",
@@ -3523,7 +3734,7 @@ export function createAgentDeleteTool(
           operation: `delete:${target.id}:${params.force === true ? "force" : "normal"}:${params.reassign_to ?? ""}`,
         });
 
-        const request = options.approvalRequestStore.create({
+        const request = await options.approvalRequestStore.create({
           requester: { actorId: callingAgentId, actorType: "agent", actorName: caller?.name ?? callingAgentId },
           targetAction: {
             category: "agent_provisioning",
@@ -3799,7 +4010,7 @@ export function createSendMessageTool(
         }
 
         const result = await deliveryHandler.runWithBoundedRetry({
-          run: async () => Promise.resolve(messageStore.sendMessage({
+          run: async () => messageStore.sendMessage({
             fromId: fromAgentId,
             fromType: "agent",
             toId: recipient.id,
@@ -3807,7 +4018,7 @@ export function createSendMessageTool(
             content,
             type: messageType,
             ...(replyToMessageId ? { metadata: { replyTo: { messageId: replyToMessageId } } } : {}),
-          })),
+          }),
           correlation: { kind: "direct", fromAgentId, toId: recipient.id },
         }, options?.autoRecovery ?? { mode: "deterministic-only", maxRetries: 3 }, async () => {
           const taskId = _ctx?.taskId as string | undefined;
@@ -3901,6 +4112,17 @@ export function createResearchTools(options: ResearchToolsOptions): ToolDefiniti
     inFlight: new Map(),
   };
 
+  // FNXC:ResearchStore 2026-06-27-12:35:
+  // The ResearchOrchestrator + the research tools' direct reads require the sync
+  // EventEmitter ResearchStore. In PG backend mode getResearchStore() returns the
+  // AsyncResearchStore (CRUD-only), so resolve to the sync store or null and degrade
+  // the research tools — AI research EXECUTION stays unavailable in PG mode (the
+  // dashboard CRUD/lifecycle surface is the ported boundary).
+  const resolveSyncResearchStore = (): ResearchStore | null => {
+    const resolved = options.store.getResearchStore();
+    return resolved instanceof ResearchStore ? resolved : null;
+  };
+
   const ensureOrchestrator = async (): Promise<ResearchOrchestrator | null> => {
     const settings = await options.getSettings();
     const resolved = resolveResearchSettings(settings);
@@ -3920,6 +4142,11 @@ export function createResearchTools(options: ResearchToolsOptions): ToolDefiniti
       return null;
     }
 
+    const syncResearchStore = resolveSyncResearchStore();
+    if (!syncResearchStore) {
+      return null;
+    }
+
     if (!orchestratorState.orchestrator) {
       const stepRunner = new ResearchStepRunner({
         providers: availableProviders
@@ -3927,7 +4154,7 @@ export function createResearchTools(options: ResearchToolsOptions): ToolDefiniti
           .filter((provider): provider is NonNullable<typeof provider> => Boolean(provider)),
       });
       orchestratorState.orchestrator = new ResearchOrchestrator({
-        store: options.store.getResearchStore(),
+        store: syncResearchStore,
         stepRunner,
         maxConcurrentRuns: resolved.limits.maxConcurrentRuns,
       });
@@ -3954,7 +4181,7 @@ export function createResearchTools(options: ResearchToolsOptions): ToolDefiniti
 
       const registry = orchestratorState.providerRegistry;
       const availableProviderTypes = registry?.getAvailableProviders() ?? [];
-      const runId = orchestrator.createRun({
+      const runId = await orchestrator.createRun({
         providers: availableProviderTypes
           .filter((type) => type !== "llm-synthesis")
           .map((type) => ({ type, config: { maxResults: resolved.limits.maxSourcesPerRun, timeoutMs: resolved.limits.requestTimeoutMs } })),
@@ -3969,7 +4196,7 @@ export function createResearchTools(options: ResearchToolsOptions): ToolDefiniti
       void runPromise.finally(() => orchestratorState.inFlight.delete(runId));
 
       if (!params.wait_for_completion) {
-        const started = options.store.getResearchStore().getRun(runId);
+        const started = resolveSyncResearchStore()?.getRun(runId);
         if (!started) {
           return {
             content: [{ type: "text" as const, text: `Started research run ${runId} for: ${params.query}` }],
@@ -3986,7 +4213,7 @@ export function createResearchTools(options: ResearchToolsOptions): ToolDefiniti
       const completed = await Promise.race([
         runPromise,
         new Promise<ResearchRun>((resolve) => setTimeout(() => {
-          const latest = options.store.getResearchStore().getRun(runId);
+          const latest = resolveSyncResearchStore()?.getRun(runId);
           resolve(latest ?? ({
             id: runId,
             query: params.query,
@@ -4014,10 +4241,10 @@ export function createResearchTools(options: ResearchToolsOptions): ToolDefiniti
     parameters: researchListParams,
     execute: async (_id: string, params: Static<typeof researchListParams>) => {
       const limit = Math.max(1, Math.min(params.limit ?? 10, 50));
-      const runs = options.store.getResearchStore().listRuns({
+      const runs = resolveSyncResearchStore()?.listRuns({
         status: params.status as ResearchRunStatus | undefined,
         limit,
-      });
+      }) ?? [];
       const text = runs.length
         ? runs.map((run) => `- ${run.id} [${run.status}] ${run.query}`).join("\n")
         : "No research runs found.";
@@ -4034,7 +4261,7 @@ export function createResearchTools(options: ResearchToolsOptions): ToolDefiniti
     description: "Get one research run with structured findings and citations.",
     parameters: researchGetParams,
     execute: async (_id: string, params: Static<typeof researchGetParams>) => {
-      const run = options.store.getResearchStore().getRun(params.id);
+      const run = resolveSyncResearchStore()?.getRun(params.id);
       if (!run) {
         return {
           content: [{ type: "text" as const, text: `Research run ${params.id} not found.` }],
@@ -4059,8 +4286,8 @@ export function createResearchTools(options: ResearchToolsOptions): ToolDefiniti
       if (!orchestrator) {
         return researchUnavailable("provider-unavailable", "Research orchestrator is unavailable because research providers are not configured.");
       }
-      const cancelled = orchestrator.cancelRun(params.id);
-      const run = options.store.getResearchStore().getRun(params.id);
+      const cancelled = await orchestrator.cancelRun(params.id);
+      const run = resolveSyncResearchStore()?.getRun(params.id);
       if (!run) {
         return {
           content: [{ type: "text" as const, text: `Research run ${params.id} not found.` }],
@@ -4118,7 +4345,7 @@ export function createPostRoomMessageTool(
       }
 
       try {
-        const isMember = chatStore.listRoomMembers(params.roomId).some((member) => member.agentId === fromAgentId);
+        const isMember = (await chatStore.listRoomMembers(params.roomId)).some((member) => member.agentId === fromAgentId);
         if (!isMember) {
           return {
             content: [{ type: "text" as const, text: `ERROR: Agent ${fromAgentId} is not a member of room ${params.roomId}` }],
@@ -4182,11 +4409,11 @@ export function createReadMessagesTool(messageStore: MessageStore, agentId: stri
     return `${value.slice(0, REPLY_CONTEXT_CONTENT_MAX_CHARS - 1)}…`;
   };
 
-  const resolveReplyContext = (msg: Message): {
+  const resolveReplyContext = async (msg: Message): Promise<{
     parentMessageId: string;
     parentMessage: Message | null;
     missingParent: boolean;
-  } | null => {
+  } | null> => {
     const metadata = msg.metadata;
     const parentMessageId = typeof metadata === "object"
       && metadata !== null
@@ -4202,7 +4429,7 @@ export function createReadMessagesTool(messageStore: MessageStore, agentId: stri
       return null;
     }
 
-    const parentMessage = messageStore.getMessage(parentMessageId);
+    const parentMessage = await messageStore.getMessage(parentMessageId);
     return {
       parentMessageId,
       parentMessage,
@@ -4226,7 +4453,7 @@ export function createReadMessagesTool(messageStore: MessageStore, agentId: stri
           limit,
         };
 
-        const messages = messageStore.getInbox(agentId, "agent", filter);
+        const messages = await messageStore.getInbox(agentId, "agent", filter);
 
         if (messages.length === 0) {
           return {
@@ -4235,13 +4462,13 @@ export function createReadMessagesTool(messageStore: MessageStore, agentId: stri
           };
         }
 
-        const messageEntries = messages.map((msg: Message) => {
-          const replyContext = resolveReplyContext(msg);
+        const messageEntries = await Promise.all(messages.map(async (msg: Message) => {
+          const replyContext = await resolveReplyContext(msg);
           return {
             message: msg,
             replyContext,
           };
-        });
+        }));
 
         const lines = messageEntries.map(({ message, replyContext }) => {
           const timestamp = new Date(message.createdAt).toLocaleString();

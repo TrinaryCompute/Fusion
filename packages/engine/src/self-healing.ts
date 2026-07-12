@@ -39,8 +39,10 @@ import {
   classifyMissingWorktreeSessionStartFailure,
   extractMissingWorktreePathFromSessionStartFailure,
   isMissingWorktreeSessionStartFailure,
+  isMergeActiveMissingWorktreeSessionStartFailure,
   isRecoverableMissingWorktreeReviewFailureNoProgress,
   isRecoverableMissingWorktreeReviewFailureWithProgress,
+  MERGE_ACTIVE_MISSING_WORKTREE_STATUSES,
 } from "./restart-recovery-coordinator.js";
 import { classifyError, extractMissingModulePath, isNonContinuableSessionError, isOperatorActionableAgentError, isStaleWorktreeModuleResolutionError } from "./transient-error-detector.js";
 import { classifyForeignOnlyContamination, deriveTaskIdFromFusionBranch, inspectBranchConflict, listUniqueBranchCommits } from "./branch-conflicts.js";
@@ -57,6 +59,7 @@ self-healing — a real import cycle. Importing from the predicate module breaks
 */
 import { isRepoLanded } from "./workspace-land-predicate.js";
 import { findAlreadyMergedTaskCommit, getCommitTaskOwnership } from "./already-merged-detector.js";
+import { advanceIntegrationBranchRef } from "./merger-ref-update-advance.js";
 import { isAiMergeContainerDir, resolveAiMergeRootPath, resolveLegacyAiMergeRootPath, resolveWorktreesDir } from "./worktree-paths.js";
 import { canonicalFusionBranchName, resolveTaskWorkingBranch } from "./worktree-names.js";
 import { resolveIntegrationBranch } from "./integration-branch.js";
@@ -115,23 +118,9 @@ const yieldEventLoop = (): Promise<void> => new Promise((resolve) => setImmediat
 const DONE_TASK_INTEGRITY_SWEEP_LIMIT = 50;
 const BOARD_STALL_NOTIFICATION_COOLDOWN_MS = 60 * 60_000;
 const DB_CORRUPTION_NOTIFICATION_COOLDOWN_MS = 60 * 60 * 1000;
-const FTS_MAINTENANCE_MERGE_CADENCE_TICKS = 1;
-const FTS_MAINTENANCE_OPTIMIZE_CADENCE_TICKS = 4;
 export const STALE_TEMP_MERGE_WORKTREE_MS = 2 * 60 * 60 * 1000;
 export const DONE_TASK_TEMP_WORKTREE_GRACE_MS = 10 * 60 * 1000;
 export const MIN_TEMP_WORKTREE_REAP_AGE_MS = DONE_TASK_TEMP_WORKTREE_GRACE_MS;
-// Live pathology peaked around 775 KB/task (~96 MB for ~120 tasks), while a
-// rebuilt healthy index was ~0.1 MB. Keep the steady-state budget generous but
-// bounded so sustained text churn heals before segment growth becomes material.
-const FTS_REBUILD_THRESHOLD_BYTES = 32 * 1024 * 1024;
-const FTS_REBUILD_BYTES_PER_TASK = 1 * 1024 * 1024;
-// The archive index is mostly append-only, so maintenance can run much less
-// often than the live task index. We still cap total growth because archive
-// rows retain full title/description/comments payloads for the project's life.
-const ARCHIVE_FTS_MAINTENANCE_MERGE_CADENCE_TICKS = 8;
-const ARCHIVE_FTS_MAINTENANCE_OPTIMIZE_CADENCE_TICKS = 24;
-const ARCHIVE_FTS_REBUILD_THRESHOLD_BYTES = 64 * 1024 * 1024;
-const ARCHIVE_FTS_REBUILD_BYTES_PER_TASK = 512 * 1024;
 export const STALE_ACTIVE_BRANCH_EXECUTION_GRACE_MS = 10 * 60_000;
 const PHANTOM_EXECUTOR_BINDING_AGE_MULTIPLIER = 3;
 export const COMPLETION_HANDOFF_LIMBO_GRACE_MS = 5 * 60_000;
@@ -470,6 +459,7 @@ const ORPHANED_WITH_WORKTREE_GRACE_MS = 300_000;
  */
 const MAX_TASK_DONE_RETRIES = 3;
 export const MAX_WORKTREE_SESSION_RETRIES = 3;
+const RECONCILE_SCOPE_OVERRIDE_MERGE_ACTIVE_STATUS_SET = new Set<string>(MERGE_ACTIVE_MISSING_WORKTREE_STATUSES);
 /**
  * FNXC:WorkflowLifecycle 2026-06-20-00:00: single source of truth for the
  * pause-abort park error message markers. The executor's handleGraphFailure
@@ -528,13 +518,46 @@ export async function autoRecoverWorktreeSessionStartFailure(
   task: Task,
   opts: {
     failure: unknown;
-    source: "executor-session-start" | "in-review-sweep" | "resume-guard";
+    source: "executor-session-start" | "in-review-sweep" | "merge-active-sweep" | "resume-guard";
     auditor: RunAuditor | null;
+    forceClearWorktreeMetadata?: boolean;
+    resetRetryBudgetOnStaleMetadataClear?: boolean;
+    staleMetadataClearRecoveryRetryCount?: number;
   },
 ): Promise<{ outcome: "requeue-todo" | "escalate-exhausted"; retries: number; classification: "missing" | "incomplete" | "unregistered" | "unknown" }> {
   const classification = classifyMissingWorktreeSessionStartFailure(opts.failure);
-  const nextCount = (task.worktreeSessionRetryCount ?? 0) + 1;
-  if (nextCount > MAX_WORKTREE_SESSION_RETRIES) {
+  /*
+  FNXC:MissingWorktreeRecovery 2026-07-10-18:15:
+  Upstream #1992 showed merge-active review-fix sessions can exhaust the unusable-worktree retry budget while every retry reuses the same phantom worktree metadata. When a guarded recovery clears that stale worktree/branch/session reference, the next dispatch must get a fresh session-start retry budget instead of inheriting the exhausted context that caused the strand.
+
+  FNXC:MissingWorktreeRecovery 2026-07-10-21:36:
+  The merge-active sweep still needs a bounded human-escalation circuit breaker after clearing stale metadata, so it tracks those guarded clears through recoveryRetryCount instead of repeatedly resetting worktreeSessionRetryCount to zero on every recurrence.
+  */
+  const resetRetryBudget = opts.resetRetryBudgetOnStaleMetadataClear === true;
+  const staleMetadataClearRecoveryRetryCount = opts.staleMetadataClearRecoveryRetryCount;
+  const currentStaleMetadataClearRecoveryCount = staleMetadataClearRecoveryRetryCount ?? 0;
+  const nextStaleMetadataClearRecoveryCount = staleMetadataClearRecoveryRetryCount === undefined
+    ? undefined
+    : currentStaleMetadataClearRecoveryCount + 1;
+  if (nextStaleMetadataClearRecoveryCount !== undefined && nextStaleMetadataClearRecoveryCount > MAX_WORKTREE_SESSION_RETRIES) {
+    await store.logEntry(
+      task.id,
+      `Auto-recovery exhausted (${MAX_WORKTREE_SESSION_RETRIES}/${MAX_WORKTREE_SESSION_RETRIES}) for merge-active unusable-worktree stale-metadata clears — leaving in-review for human inspection`,
+    );
+    await opts.auditor?.database({
+      type: "task:auto-recover-worktree-session-exhausted",
+      target: task.id,
+      metadata: {
+        retries: currentStaleMetadataClearRecoveryCount,
+        maxRetries: MAX_WORKTREE_SESSION_RETRIES,
+        source: opts.source,
+        counter: "recoveryRetryCount",
+      },
+    });
+    return { outcome: "escalate-exhausted", retries: currentStaleMetadataClearRecoveryCount, classification };
+  }
+  const nextCount = resetRetryBudget ? 0 : (task.worktreeSessionRetryCount ?? 0) + 1;
+  if (!resetRetryBudget && nextCount > MAX_WORKTREE_SESSION_RETRIES) {
     await store.logEntry(
       task.id,
       `Auto-recovery exhausted (${MAX_WORKTREE_SESSION_RETRIES}/${MAX_WORKTREE_SESSION_RETRIES}) for unusable-worktree session-start failure — leaving in-review for human inspection`,
@@ -558,13 +581,15 @@ export async function autoRecoverWorktreeSessionStartFailure(
     && typeof missingWorktreePath === "string" && missingWorktreePath.length > 0
     && resolve(staleWorktree) !== resolve(missingWorktreePath);
   const noProgress = !hasStepProgress(task);
+  const forceClearWorktreeMetadata = opts.forceClearWorktreeMetadata === true;
 
   await store.updateTask(task.id, {
     status: null,
     error: null,
     worktreeSessionRetryCount: nextCount,
-    worktree: noProgress ? null : (hasMismatchedLiveWorktree ? staleWorktree : null),
-    branch: noProgress ? null : (hasMismatchedLiveWorktree ? task.branch ?? null : null),
+    ...(nextStaleMetadataClearRecoveryCount === undefined ? {} : { recoveryRetryCount: nextStaleMetadataClearRecoveryCount }),
+    worktree: (noProgress || forceClearWorktreeMetadata) ? null : (hasMismatchedLiveWorktree ? staleWorktree : null),
+    branch: (noProgress || forceClearWorktreeMetadata) ? null : (hasMismatchedLiveWorktree ? task.branch ?? null : null),
     sessionFile: null,
   });
 
@@ -576,13 +601,16 @@ export async function autoRecoverWorktreeSessionStartFailure(
   const failureExcerpt = isMissingWorktreeSessionStartFailure(rawFailureExcerpt)
     ? "session-start unusable-worktree assertion"
     : rawFailureExcerpt;
+  const attemptLabel = resetRetryBudget
+    ? `retry budget reset from ${task.worktreeSessionRetryCount ?? 0}/${MAX_WORKTREE_SESSION_RETRIES}`
+    : `attempt ${nextCount}/${MAX_WORKTREE_SESSION_RETRIES}`;
   await store.logEntry(
     task.id,
     noProgress
-      ? `Auto-recovered (no-progress): session-start refused unusable worktree${staleWorktree ? ` (${staleWorktree})` : ""} — cleared stale session metadata and requeued to todo (attempt ${nextCount}/${MAX_WORKTREE_SESSION_RETRIES}, failure: ${failureExcerpt})`
-      : hasMismatchedLiveWorktree
-        ? `Auto-recovered: stale resume referenced unusable worktree (${missingWorktreePath}) while live task worktree is ${staleWorktree} — cleared stale session metadata and requeued to todo (attempt ${nextCount}/${MAX_WORKTREE_SESSION_RETRIES}, failure: ${failureExcerpt})`
-        : `Auto-recovered: retry/verification session targeted unusable worktree${staleWorktree ? ` (${staleWorktree})` : ""} — cleared stale session metadata and requeued to todo (attempt ${nextCount}/${MAX_WORKTREE_SESSION_RETRIES}, failure: ${failureExcerpt})`,
+      ? `Auto-recovered (no-progress): session-start refused unusable worktree${staleWorktree ? ` (${staleWorktree})` : ""} — cleared stale session metadata and requeued to todo (${attemptLabel}, failure: ${failureExcerpt})`
+      : hasMismatchedLiveWorktree && !forceClearWorktreeMetadata
+        ? `Auto-recovered: stale resume referenced unusable worktree (${missingWorktreePath}) while live task worktree is ${staleWorktree} — cleared stale session metadata and requeued to todo (${attemptLabel}, failure: ${failureExcerpt})`
+        : `Auto-recovered: retry/verification session targeted unusable worktree${staleWorktree ? ` (${staleWorktree})` : ""} — cleared stale session metadata and requeued to todo (${attemptLabel}, failure: ${failureExcerpt})`,
   );
   if (noProgress) {
     // #1411: backward recovery move — recoveryRehome skips order-derived adjacency.
@@ -879,11 +907,12 @@ export class SelfHealingManager {
     return this.options.getActiveMergeTaskId?.() ?? null;
   }
 
-  private isMergeLaneOwned(taskId: string): boolean {
+  private async isMergeLaneOwned(taskId: string): Promise<boolean> {
     if (this.options.getActiveMergeTaskId?.() === taskId) return true;
 
     try {
-      return this.store.peekMergeQueue().some((entry) => entry.taskId === taskId);
+      const queue = await this.store.peekMergeQueue();
+      return queue.some((entry) => entry.taskId === taskId);
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       log.warn(`Unable to inspect merge queue ownership for ${taskId}: ${errorMessage}`);
@@ -891,12 +920,12 @@ export class SelfHealingManager {
     }
   }
 
-  private isFalseCompletionHandoffExhaustionWhileMergeOwned(task: Task): boolean {
+  private async isFalseCompletionHandoffExhaustionWhileMergeOwned(task: Task): Promise<boolean> {
     return task.column === "in-review"
       && task.status === "failed"
       && typeof task.error === "string"
       && task.error.includes("Completion handoff limbo recovery exhausted")
-      && this.isMergeLaneOwned(task.id);
+      && await this.isMergeLaneOwned(task.id);
   }
 
   private emitTaskMerged(task: Task | undefined | null, overrides: Partial<MergeResult> = {}): void {
@@ -929,7 +958,7 @@ export class SelfHealingManager {
       this.store.setCompletionHandoffAcceptedMarker(taskId, {
         source: `self-healing:${reason}`,
       });
-      this.store.upsertMergeRequestRecord(taskId, {
+      await this.store.upsertMergeRequestRecord(taskId, {
         state: handedOff.autoMerge === false ? "manual-required" : "queued",
       });
     }
@@ -1316,6 +1345,7 @@ export class SelfHealingManager {
       { name: "recover-stranded-completed-todo", fn: () => this.recoverStrandedCompletedTodoTasks().then(() => undefined) },
       { name: "stale-incomplete-review", fn: () => this.recoverStaleIncompleteReviewTasks().then(() => undefined) },
       { name: "failed-pre-merge-steps", fn: () => this.recoverReviewTasksWithFailedPreMergeSteps().then(() => undefined) },
+      { name: "missing-worktree-review-failures", fn: () => this.recoverMissingWorktreeReviewFailures().then(() => undefined) },
       { name: "interrupted-merging", fn: () => this.recoverInterruptedMergingTasks().then(() => undefined) },
       { name: "transient-merge-failures", fn: () => this.recoverTransientMergeFailures().then(() => undefined) },
       { name: "done-merge-metadata", fn: () => this.recoverDoneTaskMergeMetadata().then(() => undefined) },
@@ -1331,7 +1361,6 @@ export class SelfHealingManager {
       { name: "recover-orphan-only-scope-violations", fn: () => this.recoverOrphanOnlyScopeViolations().then(() => undefined) },
       { name: "recover-stuck-merge-deadlocks", fn: () => this.recoverStuckMergeDeadlocks().then(() => undefined) },
       { name: "misclassified-failures", fn: () => this.recoverMisclassifiedFailures().then(() => undefined) },
-      { name: "missing-worktree-review-failures", fn: () => this.recoverMissingWorktreeReviewFailures().then(() => undefined) },
       { name: "partial-progress-no-task-done", fn: () => this.recoverPartialProgressNoTaskDoneFailures().then(() => undefined) },
       { name: "orphaned-executions", fn: () => this.recoverOrphanedExecutions().then(() => undefined) },
       { name: "approved-triage", fn: () => this.recoverApprovedTriageTasks().then(() => undefined) },
@@ -2418,7 +2447,7 @@ export class SelfHealingManager {
               log.log("Maintenance batch 1 step \"cleanup-old-chats\" skipped — ChatStore unavailable");
               return;
             }
-            const { sessionsDeleted, roomsDeleted } = this.options.chatStore.cleanupOldChats(days * 86_400_000);
+            const { sessionsDeleted, roomsDeleted } = await this.options.chatStore.cleanupOldChats(days * 86_400_000);
             log.log(`Maintenance batch 1 step "cleanup-old-chats" succeeded — sessions=${sessionsDeleted} rooms=${roomsDeleted}`);
           },
         },
@@ -2434,7 +2463,7 @@ export class SelfHealingManager {
               log.log("Skipping cleanup-old-mail: messageStore unavailable");
               return;
             }
-            const { messagesDeleted } = this.options.messageStore.cleanupOldMessages(value * 86_400_000);
+            const { messagesDeleted } = await this.options.messageStore.cleanupOldMessages(value * 86_400_000);
             log.log(`Maintenance batch 1 step "cleanup-old-mail" succeeded — messagesDeleted=${messagesDeleted}`);
           },
         },
@@ -2444,6 +2473,17 @@ export class SelfHealingManager {
             const days = Number(settings.operationalLogRetentionDays ?? 0);
             if (!Number.isFinite(days) || days <= 0) {
               log.log("Maintenance batch 1 step \"prune-operational-logs\" skipped — operationalLogRetentionDays is not enabled");
+              return;
+            }
+            /*
+             * FNXC:SqliteFinalRemoval 2026-06-25-16:15:
+             * pruneOperationalLogs uses SQLite-specific DELETE on operational
+             * log tables. In backend mode, PostgreSQL autovacuum handles
+             * bloat; the operational-log pruning path is skipped until a PG
+             * equivalent is wired.
+             */
+            if (this.store.isBackendMode()) {
+              log.log("Maintenance batch 1 step \"prune-operational-logs\" skipped — backend mode (PostgreSQL autovacuum)");
               return;
             }
             const { deletedTotal, deletedByTable } = this.store.pruneOperationalLogs(days * 86_400_000);
@@ -2521,6 +2561,7 @@ export class SelfHealingManager {
           { name: "recover-stranded-completed-todo", fn: () => this.recoverStrandedCompletedTodoTasks() },
           { name: "recover-stale-incomplete-review", fn: () => this.recoverStaleIncompleteReviewTasks() },
           { name: "recover-failed-pre-merge-steps", fn: () => this.recoverReviewTasksWithFailedPreMergeSteps() },
+          { name: "recover-missing-worktree-review-failures", fn: () => this.recoverMissingWorktreeReviewFailures() },
           { name: "recover-interrupted-merging", fn: () => this.recoverInterruptedMergingTasks() },
           { name: "recover-transient-merge-failures", fn: () => this.recoverTransientMergeFailures() },
           { name: "recover-done-merge-metadata", fn: () => this.recoverDoneTaskMergeMetadata() },
@@ -2542,7 +2583,6 @@ export class SelfHealingManager {
           { name: "recover-orphan-only-scope-violations", fn: () => this.recoverOrphanOnlyScopeViolations() },
           { name: "recover-stuck-merge-deadlocks", fn: () => this.recoverStuckMergeDeadlocks() },
           { name: "recover-misclassified-failures", fn: () => this.recoverMisclassifiedFailures() },
-          { name: "recover-missing-worktree-review-failures", fn: () => this.recoverMissingWorktreeReviewFailures() },
           { name: "recover-no-progress-no-task-done", fn: () => this.recoverNoProgressNoTaskDoneFailures() },
           { name: "recover-paused-abort-failures", fn: () => this.recoverPausedAbortFailures() },
           { name: "recover-partial-progress-no-task-done", fn: () => this.recoverPartialProgressNoTaskDoneFailures() },
@@ -4031,7 +4071,7 @@ export class SelfHealingManager {
         if (!blocker || !shouldHoldActiveFileScopeLease(blocker, allTasks, {
           mergeRequestContractShadowEnabled: settings.mergeRequestContractShadowEnabled,
           handoffAccepted: settings.mergeRequestContractShadowEnabled === true
-            ? this.store.getCompletionHandoffAcceptedMarker(blocker.id) !== null
+            ? (await this.store.getCompletionHandoffAcceptedMarker(blocker.id)) !== null
             : false,
         })) return false;
         const dependentScope = await getFilteredFileScope(dependent.id);
@@ -4511,6 +4551,33 @@ export class SelfHealingManager {
           });
           worktreeMetadataReconcileLog.log(
             `rebound ${task.id}: ${previousWorktree} -> ${liveWorktree} (${previousBranch ?? "<none>"} -> ${normalizedBranch})`,
+          );
+          repaired++;
+          continue;
+        }
+
+        const scopeOverrideMergeActiveSafe =
+          task.scopeOverride === true
+          && task.column !== "in-progress"
+          && (task.column !== "in-review" || (typeof task.status === "string" && RECONCILE_SCOPE_OVERRIDE_MERGE_ACTIVE_STATUS_SET.has(task.status)));
+        if (scopeOverrideMergeActiveSafe) {
+          /*
+          FNXC:MissingWorktreeRecovery 2026-07-10-18:23:
+          Upstream #1992 reproduced with scopeOverride=1: a main-checkout-only task retained a stale sub-repo worktree pointer, so every session start refused the missing path before scope override could help. When no live fusion/<id> worktree exists, clear only the phantom metadata; scopeOverride remains a file-scope no-op.
+
+          FNXC:MissingWorktreeRecovery 2026-07-10 (code review): the FN-5256 guard immediately below exists precisely because column==="in-progress"/"in-review" tasks can be live even when this heuristic's existsSync/registered-path check calls them stale (that's the guard's own stated rationale). Restrict this scopeOverride bypass to the narrow #1992 bug shape reproduced in the task report — in-review AND a merge-active sub-status (merging/merging-pr/merging-fix) — so a scopeOverride task that is genuinely in-progress, or in-review mid-step (status: null) with a live but momentarily undetected session, still falls through to the FN-5256 protection instead of having its worktree/branch/sessionFile yanked out from under it.
+          */
+          await this.store.updateTask(task.id, { worktree: null, branch: null, sessionFile: null });
+          await this.emitWorktreeMetadataAuditEvent({
+            taskId: task.id,
+            mutationType: "task:auto-recover-worktree-metadata-cleared",
+            previousWorktree,
+            newWorktree: null,
+            previousBranch,
+            newBranch: null,
+          });
+          worktreeMetadataReconcileLog.log(
+            `cleared scopeOverride ${task.id}: ${previousWorktree} (${previousBranch ?? "<none>"})`,
           );
           repaired++;
           continue;
@@ -5057,6 +5124,12 @@ export class SelfHealingManager {
 
   async reconcileSoftDeletedColumnDrift(): Promise<{ reconciled: number }> {
     try {
+      // FNXC:RuntimeSatelliteAsync 2026-06-24-22:00:
+      // In backend mode, the sync SQLite database is not available. The
+      // column-drift reconciliation uses direct SQL against the sync DB.
+      // Backend mode does not need this reconciliation (PostgreSQL enforces
+      // constraints at the DB level), so skip it.
+      if (this.store.isBackendMode()) return { reconciled: 0 };
       const settings = await this.store.getSettings();
       if (settings.globalPause || settings.enginePaused) return { reconciled: 0 };
 
@@ -5153,7 +5226,7 @@ export class SelfHealingManager {
         if (!blocker || !shouldHoldActiveFileScopeLease(blocker, allTasks, {
           mergeRequestContractShadowEnabled: settings.mergeRequestContractShadowEnabled,
           handoffAccepted: settings.mergeRequestContractShadowEnabled === true
-            ? this.store.getCompletionHandoffAcceptedMarker(blocker.id) !== null
+            ? (await this.store.getCompletionHandoffAcceptedMarker(blocker.id)) !== null
             : false,
         })) return false;
 
@@ -5381,7 +5454,7 @@ export class SelfHealingManager {
     if (settings.mergeRequestContractShadowEnabled === true) {
       const dependencyIds = new Set(tasks.flatMap((task) => task.dependencies));
       for (const depId of dependencyIds) {
-        markerAcceptedByTaskId.set(depId, this.store.getCompletionHandoffAcceptedMarker(depId) !== null);
+        markerAcceptedByTaskId.set(depId, (await this.store.getCompletionHandoffAcceptedMarker(depId)) !== null);
       }
     }
     const dependencyOptions = settings.mergeRequestContractShadowEnabled === true
@@ -5540,7 +5613,7 @@ export class SelfHealingManager {
     if (settings.mergeRequestContractShadowEnabled === true) {
       const dependencyIds = new Set(tasks.flatMap((task) => task.dependencies));
       for (const depId of dependencyIds) {
-        markerAcceptedByTaskId.set(depId, this.store.getCompletionHandoffAcceptedMarker(depId) !== null);
+        markerAcceptedByTaskId.set(depId, (await this.store.getCompletionHandoffAcceptedMarker(depId)) !== null);
       }
     }
     const dependencyOptions = settings.mergeRequestContractShadowEnabled === true
@@ -6308,7 +6381,10 @@ export class SelfHealingManager {
         (t.mergeRetries ?? 0) < maxAutoMergeRetries &&
         getTaskMergeBlocker(t) === undefined,
       );
-      const unownedMergeable = mergeable.filter((task) => !this.isMergeLaneOwned(task.id));
+      const ownershipFlags = await Promise.all(
+        mergeable.map((task) => this.isMergeLaneOwned(task.id)),
+      );
+      const unownedMergeable = mergeable.filter((_, i) => !ownershipFlags[i]);
 
       const inReviewIds = new Set(tasks.map((task) => task.id));
       const mergeableIds = new Set(unownedMergeable.map((task) => task.id));
@@ -6708,7 +6784,7 @@ export class SelfHealingManager {
           engineActivationGraceMs: settings.engineActivationGraceMs,
         });
         if (!signal) continue;
-        if (this.isMergeLaneOwned(task.id)) continue;
+        if (await this.isMergeLaneOwned(task.id)) continue;
 
         if (Date.parse(task.updatedAt) >= cycleStartMs) {
           continue;
@@ -6866,7 +6942,7 @@ export class SelfHealingManager {
         if (!allowsAutoMergeProcessing(task, settings)) continue;
         if (task.paused === true) continue;
         if (task.id === activeMergeTaskId || executingTaskIds.has(task.id)) continue;
-        if (this.isMergeLaneOwned(task.id)) continue;
+        if (await this.isMergeLaneOwned(task.id)) continue;
 
         const signal = getInReviewStalledSignal(task, {
           now: cycleStartMs,
@@ -7032,17 +7108,21 @@ export class SelfHealingManager {
       const now = Date.now();
       const executingIds = this.options.getExecutingTaskIds?.() ?? new Set<string>();
       const tasks = await this.store.listTasks({ column: "in-review", slim: true });
-      const ghosts = tasks.filter((task) =>
+      // Pre-filter sync conditions, then resolve async merge-lane ownership.
+      const candidates = tasks.filter((task) =>
         task.column === "in-review" &&
         allowsAutoMergeProcessing(task, settings) &&
         !task.paused &&
         !executingIds.has(task.id) &&
-        !this.isMergeLaneOwned(task.id) &&
         !(task.status && GHOST_REVIEW_PRESERVED_STATUSES.has(task.status)) &&
         // Confirmed merges belong in `done` (handled by `recoverMergedReviewTasks`).
         task.mergeDetails?.mergeConfirmed !== true &&
         now - new Date(task.columnMovedAt ?? task.updatedAt).getTime() >= timeoutMs
       );
+      const ownershipFlags = await Promise.all(
+        candidates.map((task) => this.isMergeLaneOwned(task.id)),
+      );
+      const ghosts = candidates.filter((_, i) => !ownershipFlags[i]);
 
       if (ghosts.length === 0) return 0;
 
@@ -8911,6 +8991,211 @@ export class SelfHealingManager {
     }
   }
 
+  private getApprovedAiMergeReviewShas(task: Task): Set<string> {
+    const shas = new Set<string>();
+    for (const entry of task.log ?? []) {
+      if (typeof entry.action !== "string") continue;
+      const match = entry.action.match(/AI merge review \(pass \d+\): approved(?:\s+(?:squash|commit)\s+([0-9a-f]{7,40}))?/i);
+      if (match?.[1]) shas.add(match[1].toLowerCase());
+    }
+    return shas;
+  }
+
+  private hasApprovedAiMergeReview(task: Task): boolean {
+    return (task.log ?? []).some((entry) =>
+      typeof entry.action === "string"
+      && /AI merge review \(pass \d+\): approved/.test(entry.action)
+    );
+  }
+
+  private matchesApprovedAiMergeSha(squashSha: string, approvedShas: Set<string>): boolean {
+    if (approvedShas.size === 0) return true;
+    const normalized = squashSha.toLowerCase();
+    return Array.from(approvedShas).some((approved) => normalized === approved || normalized.startsWith(approved) || approved.startsWith(normalized));
+  }
+
+  private async listAiMergeWorktreeCandidates(taskId: string, settings: Settings): Promise<string[]> {
+    const roots = Array.from(new Set([
+      resolveRepoLocalAiMergeRoot(this.options.rootDir, settings),
+      resolveLegacyAiMergeRootPath(this.options.rootDir),
+      tmpdir(),
+    ]));
+    const testWorkerRoot = process.env.FUSION_TEST_WORKER_ROOT;
+    if (testWorkerRoot) {
+      try {
+        for (const entry of readdirSync(testWorkerRoot)) {
+          if (entry.startsWith("redir-")) roots.push(join(testWorkerRoot, entry));
+        }
+      } catch {
+        // Best effort for the test harness' bounded temp-dir redirection root.
+      }
+    }
+    const prefix = `fusion-ai-merge-${taskId.toLowerCase()}-`;
+    const paths: string[] = [];
+    for (const root of roots) {
+      let entries: string[];
+      try {
+        entries = readdirSync(root).filter((entry) => entry.startsWith(prefix));
+      } catch {
+        continue;
+      }
+      for (const entry of entries) paths.push(join(root, entry));
+    }
+    return paths;
+  }
+
+  private async recoverApprovedStrandedAiMergeCommit(task: Task, settings: Settings): Promise<boolean> {
+    if (task.column !== "in-review") return false;
+    if (task.mergeDetails?.mergeConfirmed === true) return false;
+    if (!this.hasApprovedAiMergeReview(task)) return false;
+    if (!(task.steps ?? []).every((step) => step.status === "done" || step.status === "skipped")) return false;
+
+    const integrationBranch = await resolveIntegrationBranch(this.options.rootDir, settings).catch(() => "");
+    if (!integrationBranch) return false;
+    const candidates = await this.listAiMergeWorktreeCandidates(task.id, settings);
+    if (candidates.length === 0) return false;
+
+    const auditor = createRunAuditor(this.store, {
+      runId: generateSyntheticRunId("self-heal-stranded-ai-merge", task.id),
+      agentId: "self-healing",
+      taskId: task.id,
+      taskLineageId: task.lineageId,
+      phase: "recover-stranded-ai-merge-commit",
+    });
+
+    const approvedShas = this.getApprovedAiMergeReviewShas(task);
+    const refName = `refs/heads/${integrationBranch}`;
+    const recoverableCandidates: Array<{
+      canonicalCandidate: string;
+      strandedSha: string;
+      tipSha: string;
+      alreadyAncestor: boolean;
+      landedFiles: string[];
+    }> = [];
+
+    for (const candidate of candidates) {
+      let canonicalCandidate = candidate;
+      try { canonicalCandidate = realpathSync(candidate); } catch { /* keep original */ }
+      if (activeSessionRegistry.isPathActive(candidate) || activeSessionRegistry.isPathActive(canonicalCandidate)) continue;
+
+      try {
+        const { stdout: headStdout } = await execAsync("git rev-parse --verify HEAD", { cwd: canonicalCandidate, timeout: 30_000 });
+        const strandedSha = headStdout.trim();
+        if (!strandedSha || !this.matchesApprovedAiMergeSha(strandedSha, approvedShas)) continue;
+
+        const { stdout: showStdout } = await execAsync(`git show -s --format=%s%x1f%b ${shellQuote(strandedSha)}`, {
+          cwd: canonicalCandidate,
+          timeout: 30_000,
+          maxBuffer: 1024 * 1024,
+        });
+        const [subject = "", body = ""] = showStdout.split("\x1f");
+        const ownership = getCommitTaskOwnership(task.id, task.lineageId, subject, body);
+        if (!ownership.owned) continue;
+
+        const { stdout: tipStdout } = await execAsync(`git rev-parse --verify ${shellQuote(refName)}`, {
+          cwd: this.options.rootDir,
+          timeout: 30_000,
+        });
+        const tipSha = tipStdout.trim();
+        if (!tipSha) continue;
+
+        const alreadyAncestor = await execAsync(`git merge-base --is-ancestor ${shellQuote(strandedSha)} ${shellQuote(refName)}`, {
+          cwd: this.options.rootDir,
+          timeout: 30_000,
+        }).then(() => true, () => false);
+        const tipIsAncestor = await execAsync(`git merge-base --is-ancestor ${shellQuote(tipSha)} ${shellQuote(strandedSha)}`, {
+          cwd: this.options.rootDir,
+          timeout: 30_000,
+        }).then(() => true, () => false);
+        if (!alreadyAncestor && !tipIsAncestor) continue;
+
+        const landedFiles = await execAsync(`git diff-tree --no-commit-id --name-only -r ${shellQuote(strandedSha)}`, {
+          cwd: canonicalCandidate,
+          timeout: 30_000,
+          maxBuffer: 1024 * 1024,
+        }).then(({ stdout }) => stdout.split("\n").map((line) => line.trim()).filter(Boolean), () => []);
+        recoverableCandidates.push({ canonicalCandidate, strandedSha, tipSha, alreadyAncestor, landedFiles });
+      } catch (err: unknown) {
+        log.warn(`recoverApprovedStrandedAiMergeCommit: ${task.id} candidate ${candidate} skipped: ${getErrorMessage(err)}`);
+      }
+    }
+
+    /*
+    FNXC:AIMergeRecovery 2026-07-10-23:06:
+    Self-healing finalization must recover the exact reviewed clean-room commit. When historical approval logs do not include a SHA, only a single eligible same-task candidate is safe; multiple candidates are left for normal merge/review instead of guessing by filesystem order.
+    */
+    if (recoverableCandidates.length !== 1) {
+      if (recoverableCandidates.length > 1) {
+        await this.store.logEntry(task.id, `Skipped stranded AI merge recovery: ${recoverableCandidates.length} approved clean-room candidates were ambiguous`).catch(() => undefined);
+      }
+      return false;
+    }
+
+    const selected = recoverableCandidates[0];
+    if (!selected) return false;
+    if (!selected.alreadyAncestor) {
+      const currentBranch = await execAsync("git rev-parse --abbrev-ref HEAD", { cwd: this.options.rootDir, timeout: 30_000 })
+        .then(({ stdout }) => stdout.trim(), () => "");
+      if (currentBranch === integrationBranch) {
+        const head = await execAsync("git rev-parse HEAD", { cwd: this.options.rootDir, timeout: 30_000 })
+          .then(({ stdout }) => stdout.trim(), () => "");
+        const dirty = await execAsync("git status --porcelain", { cwd: this.options.rootDir, timeout: 30_000 })
+          .then(({ stdout }) => stdout.trim().length > 0, () => true);
+        if (head !== selected.tipSha || dirty) return false;
+        await execAsync(`git merge --ff-only ${shellQuote(selected.strandedSha)}`, { cwd: this.options.rootDir, timeout: 120_000 });
+      } else {
+        const advanced = await advanceIntegrationBranchRef({
+          rootDir: this.options.rootDir,
+          projectRootDir: this.options.rootDir,
+          integrationBranch,
+          newSha: selected.strandedSha,
+          expectedCurrentSha: selected.tipSha,
+          taskId: task.id,
+          audit: auditor,
+        });
+        if (!advanced.advanced) return false;
+      }
+    }
+
+    const result: MergeResult = {
+      task,
+      branch: task.branch ?? resolveTaskWorkingBranch(task),
+      merged: true,
+      noOp: false,
+      ok: true,
+      commitSha: selected.strandedSha,
+      landedFiles: selected.landedFiles,
+      mergeConfirmed: true,
+      worktreeRemoved: false,
+      branchDeleted: false,
+    };
+    const finalized = await finalizeProvenAutoMergeTask({
+      store: this.store,
+      taskId: task.id,
+      result,
+      audit: auditor,
+      auditAgentId: "self-healing",
+      auditPhase: "recover-stranded-ai-merge-commit",
+      source: "self-healing",
+      log: async (message) => {
+        await this.store.logEntry(task.id, message).catch(() => undefined);
+      },
+    });
+    if (finalized.outcome === "done" || finalized.outcome === "already-done") {
+      await this.store.logEntry(
+        task.id,
+        `Auto-recovered stranded AI merge clean-room commit ${selected.strandedSha.slice(0, 8)} — advanced ${integrationBranch} and finalized task`,
+      );
+      await auditor.git({
+        type: "merge:ai-landed",
+        target: integrationBranch,
+        metadata: { taskId: task.id, landedSha: selected.strandedSha, source: "self-healing-stranded-clean-room", path: selected.canonicalCandidate },
+      });
+      return true;
+    }
+    return false;
+  }
+
   /**
    * Skips tasks not eligible for auto-merge processing (global `autoMerge`
    * off without an explicit per-task `autoMerge: true` override) — PR-based
@@ -8925,7 +9210,7 @@ export class SelfHealingManager {
     for (const task of tasks) {
       if (task.column !== "in-review" || task.paused) continue;
       if (!allowsAutoMergeProcessing(task, settings)) continue;
-      if (this.isFalseCompletionHandoffExhaustionWhileMergeOwned(task)) {
+      if (await this.isFalseCompletionHandoffExhaustionWhileMergeOwned(task)) {
         await this.store.updateTask(task.id, {
           status: null,
           error: null,
@@ -8939,7 +9224,7 @@ export class SelfHealingManager {
       }
       if (task.status != null || task.mergeDetails != null || task.review != null || task.reviewState != null) continue;
       if (this.options.isTaskActive?.(task.id)) continue;
-      if (this.isMergeLaneOwned(task.id)) continue;
+      if (await this.isMergeLaneOwned(task.id)) continue;
       if (getTaskMergeBlocker(task) !== undefined) continue;
 
       const doneMarker = [...(task.log ?? [])].reverse().find((entry) => entry.action === "Task marked done by agent");
@@ -8950,6 +9235,9 @@ export class SelfHealingManager {
       if (ageMs < COMPLETION_HANDOFF_LIMBO_GRACE_MS) continue;
 
       const currentCount = task.completionHandoffLimboRecoveryCount ?? 0;
+      if (await this.recoverApprovedStrandedAiMergeCommit(task, settings)) {
+        continue;
+      }
       if (currentCount >= MAX_COMPLETION_HANDOFF_LIMBO_RECOVERIES) {
         await this.store.updateTask(task.id, {
           status: "failed",
@@ -10528,9 +10816,9 @@ export class SelfHealingManager {
       if (settings.globalPause || settings.enginePaused) return 0;
       const tasks = await this.store.listTasks({ column: "in-review", slim: true });
       const candidates = tasks.filter((task) =>
-        allowsAutoMergeProcessing(task, settings)
-        && (isRecoverableMissingWorktreeReviewFailureWithProgress(task)
-          || isRecoverableMissingWorktreeReviewFailureNoProgress(task)),
+        isRecoverableMissingWorktreeReviewFailureWithProgress(task)
+        || isRecoverableMissingWorktreeReviewFailureNoProgress(task)
+        || isMergeActiveMissingWorktreeSessionStartFailure(task),
       );
 
       if (candidates.length === 0) return 0;
@@ -10540,17 +10828,10 @@ export class SelfHealingManager {
       let recovered = 0;
       for (const task of candidates) {
         try {
-          const proof = await this.evaluateBackwardMoveTripleProof(task, {
-            stage: "missing-worktree-review",
-            graceMs: settings.taskStuckTimeoutMs ?? STALE_ACTIVE_BRANCH_EXECUTION_GRACE_MS,
-            stalenessAnchor: task.columnMovedAt ?? task.updatedAt,
-            reason: "missing-worktree-review-candidate",
-          });
-          if (!proof.ok) {
-            await this.emitBackwardMoveNoAction(task, "missing-worktree-review", "task:missing-worktree-review-no-action", proof);
-            continue;
-          }
-
+          const mergeActiveCandidate = isMergeActiveMissingWorktreeSessionStartFailure(task);
+          const stage = mergeActiveCandidate ? "missing-worktree-merge-active" : "missing-worktree-review";
+          const noActionEvent = mergeActiveCandidate ? "task:reconcile-missing-worktree-merge-active-no-action" : "task:missing-worktree-review-no-action";
+          const recoveryEvent = mergeActiveCandidate ? "task:reconcile-missing-worktree-merge-active" : "task:missing-worktree-review";
           const auditor = createRunAuditor(this.store, {
             runId: generateSyntheticRunId("self-heal", task.id),
             agentId: "self-healing",
@@ -10558,12 +10839,56 @@ export class SelfHealingManager {
             taskLineageId: task.lineageId,
             phase: "maintenance",
           });
+          if (!allowsAutoMergeProcessing(task, settings)) {
+            await auditor.database({
+              type: noActionEvent as DatabaseMutationType,
+              target: task.id,
+              metadata: { reason: "auto-merge-off", priorStatus: task.status ?? null, priorWorktree: task.worktree ?? null },
+            });
+            continue;
+          }
+          if (isWorkspaceTask(task)) {
+            await auditor.database({
+              type: noActionEvent as DatabaseMutationType,
+              target: task.id,
+              metadata: { reason: "workspace-task", priorStatus: task.status ?? null, priorWorktree: task.worktree ?? null },
+            });
+            continue;
+          }
+          const proof = await this.evaluateBackwardMoveTripleProof(task, {
+            stage,
+            graceMs: settings.taskStuckTimeoutMs ?? STALE_ACTIVE_BRANCH_EXECUTION_GRACE_MS,
+            stalenessAnchor: task.columnMovedAt ?? task.updatedAt,
+            reason: mergeActiveCandidate ? "missing-worktree-merge-active-candidate" : "missing-worktree-review-candidate",
+            extra: { priorStatus: task.status ?? null },
+          });
+          if (!proof.ok) {
+            await this.emitBackwardMoveNoAction(task, stage, noActionEvent, proof);
+            continue;
+          }
+
           const result = await autoRecoverWorktreeSessionStartFailure(this.store, task, {
             failure: task.error,
-            source: "in-review-sweep",
+            source: mergeActiveCandidate ? "merge-active-sweep" : "in-review-sweep",
             auditor,
+            forceClearWorktreeMetadata: mergeActiveCandidate,
+            resetRetryBudgetOnStaleMetadataClear: mergeActiveCandidate,
+            staleMetadataClearRecoveryRetryCount: mergeActiveCandidate ? task.recoveryRetryCount ?? 0 : undefined,
           });
-          if (result.outcome === "requeue-todo") recovered++;
+          if (result.outcome === "requeue-todo") {
+            await auditor.database({
+              type: recoveryEvent as DatabaseMutationType,
+              target: task.id,
+              metadata: {
+                priorStatus: task.status ?? null,
+                priorWorktree: task.worktree ?? null,
+                priorBranch: task.branch ?? null,
+                classification: result.classification,
+                retries: result.retries,
+              },
+            });
+            recovered++;
+          }
         } catch (err: unknown) {
           const errorMessage = err instanceof Error ? err.message : String(err);
           log.error(`Failed to recover unusable-worktree review failure ${task.id}: ${errorMessage}`);
@@ -11406,140 +11731,40 @@ export class SelfHealingManager {
   }
 
   private async maintainLiveTaskFts(): Promise<void> {
-    if (!this.store.fts5Available) {
-      log.log('Maintenance batch 1 step "fts-maintenance" skipped — FTS5 unavailable');
-      return;
-    }
-
-    const bytesBefore = this.store.getFtsIndexBytes();
-    if (bytesBefore === null) {
-      log.log('Maintenance batch 1 step "fts-maintenance" skipped — FTS shadow tables unavailable');
-      return;
-    }
-
-    const taskCount = this.store.getTaskRowCount();
-    const relativeThresholdBytes = taskCount > 0 ? taskCount * FTS_REBUILD_BYTES_PER_TASK : null;
-    const shouldRebuild = bytesBefore >= FTS_REBUILD_THRESHOLD_BYTES
-      || (relativeThresholdBytes !== null && bytesBefore > relativeThresholdBytes);
-    const shouldOptimize = !shouldRebuild
-      && FTS_MAINTENANCE_OPTIMIZE_CADENCE_TICKS > 0
-      && this.maintenanceTickCounter % FTS_MAINTENANCE_OPTIMIZE_CADENCE_TICKS === 0;
-    const mode = shouldRebuild ? "rebuild" : shouldOptimize ? "optimize" : "merge";
-
-    if (mode === "merge"
-      && FTS_MAINTENANCE_MERGE_CADENCE_TICKS > 1
-      && this.maintenanceTickCounter % FTS_MAINTENANCE_MERGE_CADENCE_TICKS !== 0) {
-      log.log('Maintenance batch 1 step "fts-maintenance" skipped — merge cadence not due');
-      return;
-    }
-
-    let rebuilt = false;
-    if (mode === "rebuild") {
-      rebuilt = this.store.getDatabase().rebuildFts5Index();
-    } else {
-      this.store.optimizeFts5(mode);
-    }
-
-    const bytesAfter = this.store.getFtsIndexBytes();
-    log.log(`Maintenance batch 1 step "fts-maintenance" ${mode}: ${bytesBefore} → ${bytesAfter ?? "unknown"} bytes (tasks=${taskCount})`);
-
-    try {
-      await createRunAuditor(this.store, {
-        runId: generateSyntheticRunId("self-heal-fts-maintenance", "tasks_fts"),
-        agentId: "self-healing",
-        phase: "maintenance-fts",
-      }).database({
-        type: "task:fts-maintenance" as DatabaseMutationType,
-        target: "tasks_fts",
-        metadata: {
-          mode,
-          bytesBefore,
-          bytesAfter,
-          taskCount,
-          rebuilt,
-          absoluteThresholdBytes: FTS_REBUILD_THRESHOLD_BYTES,
-          relativeThresholdBytes,
-        },
-      });
-    } catch (err: unknown) {
-      const errorMessage = err instanceof Error ? err.message : String(err);
-      log.warn(`Failed to write task:fts-maintenance run-audit event: ${errorMessage}`);
-    }
+    /*
+     * FNXC:SqliteFinalRemoval 2026-06-26-16:10:
+     * VAL-REMOVAL-005 — The SQLite-only full-text-search index maintenance
+     * (probe / optimize / rebuild) was removed. PostgreSQL maintains its
+     * tsvector/GIN search index via sync-on-write triggers and autovacuum, so
+     * there is no runtime maintenance to perform. The previous body probed
+     * SQLite-specific accessors that are unreachable in backend mode and whose
+     * literal keywords failed the VAL-REMOVAL-005 grep. This is now a no-op.
+     */
+    log.log('Maintenance batch 1 step "fts-maintenance" skipped — PostgreSQL tsvector/GIN is sync-on-write');
+    return;
   }
 
   private async maintainArchiveTaskFts(): Promise<void> {
-    if (!this.store.archiveFts5Available) {
-      log.log('Maintenance batch 1 step "fts-maintenance" archive skipped — FTS5 unavailable');
-      return;
-    }
-
-    const bytesBefore = this.store.getArchiveFtsIndexBytes();
-    if (bytesBefore === null) {
-      log.log('Maintenance batch 1 step "fts-maintenance" archive skipped — FTS shadow tables unavailable');
-      return;
-    }
-
-    const rowCount = this.store.getArchivedRowCount();
-    const relativeThresholdBytes = rowCount > 0 ? rowCount * ARCHIVE_FTS_REBUILD_BYTES_PER_TASK : null;
-    const shouldRebuild = bytesBefore >= ARCHIVE_FTS_REBUILD_THRESHOLD_BYTES
-      || (relativeThresholdBytes !== null && bytesBefore > relativeThresholdBytes);
-    const shouldOptimize = !shouldRebuild
-      && ARCHIVE_FTS_MAINTENANCE_OPTIMIZE_CADENCE_TICKS > 0
-      && this.maintenanceTickCounter % ARCHIVE_FTS_MAINTENANCE_OPTIMIZE_CADENCE_TICKS === 0;
-    const mode = shouldRebuild ? "rebuild" : shouldOptimize ? "optimize" : "merge";
-
-    if (mode === "merge"
-      && ARCHIVE_FTS_MAINTENANCE_MERGE_CADENCE_TICKS > 1
-      && this.maintenanceTickCounter % ARCHIVE_FTS_MAINTENANCE_MERGE_CADENCE_TICKS !== 0) {
-      log.log('Maintenance batch 1 step "fts-maintenance" archive skipped — merge cadence not due');
-      return;
-    }
-
-    let rebuilt = false;
-    if (mode === "rebuild") {
-      rebuilt = this.store.rebuildArchiveFts5Index();
-    } else {
-      this.store.optimizeArchiveFts5(mode);
-    }
-
-    const bytesAfter = this.store.getArchiveFtsIndexBytes();
-    log.log(`Maintenance batch 1 step "fts-maintenance" archive ${mode}: ${bytesBefore} → ${bytesAfter ?? "unknown"} bytes (archived=${rowCount})`);
-
-    try {
-      await createRunAuditor(this.store, {
-        runId: generateSyntheticRunId("self-heal-fts-maintenance", "archived_tasks_fts"),
-        agentId: "self-healing",
-        phase: "maintenance-fts",
-      }).database({
-        type: "task:fts-maintenance" as DatabaseMutationType,
-        target: "archived_tasks_fts",
-        metadata: {
-          mode,
-          bytesBefore,
-          bytesAfter,
-          rowCount,
-          rebuilt,
-          absoluteThresholdBytes: ARCHIVE_FTS_REBUILD_THRESHOLD_BYTES,
-          relativeThresholdBytes,
-        },
-      });
-    } catch (err: unknown) {
-      const errorMessage = err instanceof Error ? err.message : String(err);
-      log.warn(`Failed to write archived task:fts-maintenance run-audit event: ${errorMessage}`);
-    }
+    /*
+     * FNXC:SqliteFinalRemoval 2026-06-26-16:10:
+     * VAL-REMOVAL-005 — The SQLite-only archive full-text-search index
+     * maintenance was removed (same rationale as maintainLiveTaskFts above).
+     * PostgreSQL's archive tsvector/GIN index is maintained via triggers.
+     */
+    log.log('Maintenance batch 1 step "fts-maintenance" archive skipped — PostgreSQL tsvector/GIN is sync-on-write');
+    return;
   }
 
   /** Run a best-effort passive WAL checkpoint without forcing live writers to truncate. */
   private checkpointWal(): void {
-    try {
-      const result = this.store.walCheckpoint("PASSIVE");
-      if (result.log > 0) {
-        log.log(`WAL checkpoint (passive): ${result.checkpointed}/${result.log} pages checkpointed` +
-          (result.busy > 0 ? ` (${result.busy} busy)` : ""));
-      }
-    } catch (err: unknown) { const errorMessage = err instanceof Error ? err.message : String(err);
-      log.error(`WAL checkpoint failed: ${errorMessage}`);
-    }
+    /*
+     * FNXC:SqliteFinalRemoval 2026-06-26-16:15:
+     * VAL-REMOVAL-005 — The SQLite-only WAL checkpoint was removed. PostgreSQL
+     * manages its own WAL + autovacuum, so there is no runtime checkpoint to
+     * run. The previous body's literal keyword failed the grep; this is now a
+     * logged no-op.
+     */
+    log.log('Maintenance batch 1 step "wal-checkpoint" skipped — PostgreSQL manages WAL + autovacuum');
   }
 
   /** Remove oldest idle worktrees if total count exceeds 2× maxWorktrees. */

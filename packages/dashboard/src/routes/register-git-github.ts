@@ -2207,7 +2207,7 @@ async function applyChangesRequestedTransition(
         commentCount: commentItems.length,
       },
     };
-    store.recordRunAuditEvent(auditInput);
+    void store.recordRunAuditEvent(auditInput);
   }
 }
 

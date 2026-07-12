@@ -863,7 +863,7 @@ export type { Statement, VacuumResult } from "./db.js";
 export type { ProjectIdentity } from "./project-identity.js";
 export type { EnsureProjectForPathInput, EnsureProjectForPathResult } from "./central-core.js";
 export { ArchiveDatabase } from "./archive-db.js";
-export { detectLegacyData, migrateFromLegacy, getMigrationStatus } from "./db-migrate.js";
+// FNXC:SqliteFinalRemoval 2026-07-08: db-migrate.ts (legacy sqlite migration) is removed on the PostgreSQL branch; its exports are dropped from this gate barrel to match index.ts.
 export { GlobalSettingsStore, resolveGlobalDir, resolveGlobalDirForHome } from "./global-settings.js";
 export { isValidSqliteDatabaseFile } from "./sqlite-validation.js";
 export { DaemonTokenManager, DAEMON_TOKEN_PREFIX, DAEMON_TOKEN_HEX_LENGTH, isDaemonTokenFormat } from "./daemon-token.js";

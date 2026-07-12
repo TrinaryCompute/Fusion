@@ -441,6 +441,35 @@ describe("TerminalModal", () => {
     expect(container.firstChild).toBeNull();
   });
 
+  it("renders embedded mode in-flow without overlay chrome while keeping shell tabs", async () => {
+    const { container } = render(
+      <TerminalModal
+        isOpen={true}
+        onClose={mockOnClose}
+        embedded
+        defaultCwd="/project/.worktrees/FN-7813"
+        scopeId="FN-7813"
+        projectId="proj-123"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("terminal-modal")).toBeTruthy();
+    });
+
+    expect(screen.getByTestId("terminal-embedded-host")).toBeTruthy();
+    expect(container.querySelector(".terminal-embedded-host")).toBeTruthy();
+    expect(screen.queryByTestId("terminal-modal-overlay")).toBeNull();
+    expect(screen.queryByTestId("terminal-close-btn")).toBeNull();
+    expect(screen.queryByTestId("terminal-popout-toggle")).toBeNull();
+    expect(screen.queryByTestId("terminal-pin-toggle")).toBeNull();
+    expect(screen.getByTestId("terminal-tabs")).toBeTruthy();
+    expect(mockUseTerminalSessions).toHaveBeenCalledWith("proj-123", {
+      storageScope: "task:FN-7813",
+      defaultCwd: "/project/.worktrees/FN-7813",
+    });
+  });
+
   it("keeps the fast new-terminal button and hides the workspace picker when no task worktrees exist", async () => {
     render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
 
@@ -1525,6 +1554,27 @@ describe("TerminalModal", () => {
       )?.[1] ?? "";
       expect(tabletBlock).not.toMatch(/\.terminal-shortcuts--header/);
       expect(tabletBlock).not.toMatch(/\.terminal-connection-status/);
+    });
+
+    it("keeps the desktop terminal header controls on one scrollable row when narrow (FN-7823)", () => {
+      // FN-7823: large viewport breakpoints can still produce narrow floating or
+      // docked panels, so the desktop header must preserve horizontal scrolling
+      // instead of wrapping the help/status text into multiple rows.
+      const shortcutsHeaderRule = terminalModalCss.match(/\.terminal-shortcuts--header\s*\{([^}]*)\}/)?.[1] ?? "";
+      expect(shortcutsHeaderRule).toContain("white-space: nowrap;");
+
+      const actionsRule = terminalModalCss.match(/\.terminal-actions\s*\{([^}]*)\}/)?.[1] ?? "";
+      expect(actionsRule).toContain("min-width: 0;");
+      expect(actionsRule).toContain("overflow-x: auto;");
+      expect(actionsRule).not.toContain("flex-wrap: wrap;");
+
+      const connectionStatusRule = terminalModalCss.match(/\.terminal-connection-status\s*\{([^}]*)\}/)?.[1] ?? "";
+      expect(connectionStatusRule).toContain("white-space: nowrap;");
+
+      const mobileHideBlock = terminalModalCss.match(
+        /@media \(max-width: 768px\) \{[\s\S]*?\.terminal-shortcuts--header,\s*\n\s*\.terminal-connection-status \{([^}]*)\}/,
+      )?.[1] ?? "";
+      expect(mobileHideBlock).toContain("display: none;");
     });
 
     describe("real-CSS mobile cascade (FN-7621 recurrence #3)", () => {

@@ -93,6 +93,16 @@ export interface CreateCeSessionInput {
   id?: string;
 }
 
+export class PlanHandoffClaimError extends Error {
+  constructor(
+    readonly artifactPath: string,
+    readonly sessionId: string,
+  ) {
+    super(`Plan session ${sessionId} is already enriching ${artifactPath}`);
+    this.name = "PlanHandoffClaimError";
+  }
+}
+
 /**
  * Default multiple of the turn interval beyond which a non-terminal session is
  * considered stale. Mirrors the FN-4172 rubric (`> 3× interval`), interval-
@@ -164,16 +174,52 @@ function rowToSession(row: CeSessionRow): CeSession {
  * in a test) still works.
  */
 export class CeSessionStore {
-  private readonly db: Database;
+  // FNXC:RuntimeSatelliteAsync 2026-06-24-22:45:
+  // db is null in backend mode (PostgreSQL). Store methods that use sync
+  // SQLite will throw in backend mode until the async path is implemented.
+  private readonly db: Database | null;
 
-  constructor(db: Database) {
+  constructor(db: Database | null) {
     this.db = db;
-    ensureCeSchema(db);
+    if (db) ensureCeSchema(db);
+  }
+
+  /** Asserts sync db is available (throws in backend mode). */
+  private syncDb(): Database {
+    if (!this.db) throw new Error("CeSessionStore: sync Database is null (backend mode)");
+    return this.db;
   }
 
   create(input: CreateCeSessionInput): CeSession {
+    const session = this.newSession(input);
+    this.insert(session);
+    return session;
+  }
+
+  /*
+   * FNXC:CompoundEngineeringPlanning 2026-07-11-00:18:
+   * A requirements artifact can have exactly one Plan owner until that session is discarded. Claim it in the same immediate transaction as the Plan row so concurrent dashboard/API requests cannot both enrich the same document; discarding that session intentionally releases the claim for a retry.
+   */
+  createWithPlanHandoffClaim(input: CreateCeSessionInput, artifactPath: string): CeSession {
+    const session = this.newSession({ ...input, artifactPath });
+    const db = this.syncDb();
+    return db.transactionImmediate(() => {
+      const existing = db
+        .prepare("SELECT sessionId FROM ce_plan_handoff_claims WHERE artifactPath = ?")
+        .get(artifactPath) as { sessionId: string } | undefined;
+      if (existing) throw new PlanHandoffClaimError(artifactPath, existing.sessionId);
+
+      this.insert(session);
+      db
+        .prepare("INSERT INTO ce_plan_handoff_claims (artifactPath, sessionId, projectId, createdAt) VALUES (?, ?, ?, ?)")
+        .run(artifactPath, session.id, session.projectId, session.createdAt);
+      return session;
+    });
+  }
+
+  private newSession(input: CreateCeSessionInput): CeSession {
     const now = new Date().toISOString();
-    const session: CeSession = {
+    return {
       id: input.id ?? randomUUID(),
       stage: input.stage,
       status: "launching",
@@ -187,7 +233,10 @@ export class CeSessionStore {
       createdAt: now,
       updatedAt: now,
     };
-    this.db
+  }
+
+  private insert(session: CeSession): void {
+    this.syncDb()
       .prepare(
         `INSERT INTO ce_sessions
           (id, stage, status, currentQuestion, conversationHistory, projectId, artifactPath, error, turnIntervalMs, lastActivityAt, createdAt, updatedAt)
@@ -207,15 +256,14 @@ export class CeSessionStore {
         session.createdAt,
         session.updatedAt,
       );
-    return session;
   }
 
   get(id: string): CeSession | undefined {
-    const row = this.db.prepare(`SELECT * FROM ce_sessions WHERE id = ?`).get(id) as CeSessionRow | undefined;
+    const row = this.syncDb().prepare(`SELECT * FROM ce_sessions WHERE id = ?`).get(id) as CeSessionRow | undefined;
     return row ? rowToSession(row) : undefined;
   }
 
-  list(filter: { status?: CeSessionStatus; stage?: string } = {}): CeSession[] {
+  list(filter: { status?: CeSessionStatus; stage?: string; projectId?: string } = {}): CeSession[] {
     const clauses: string[] = [];
     const params: unknown[] = [];
     if (filter.status) {
@@ -226,8 +274,12 @@ export class CeSessionStore {
       clauses.push("stage = ?");
       params.push(filter.stage);
     }
+    if (filter.projectId) {
+      clauses.push("projectId = ?");
+      params.push(filter.projectId);
+    }
     const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
-    const rows = this.db
+    const rows = this.syncDb()
       .prepare(`SELECT * FROM ce_sessions ${where} ORDER BY updatedAt DESC, id`)
       .all(...params) as CeSessionRow[];
     return rows.map(rowToSession);
@@ -254,7 +306,7 @@ export class CeSessionStore {
       lastActivityAt: patch.lastActivityAt ?? Date.now(),
       updatedAt: new Date().toISOString(),
     };
-    this.db
+    this.syncDb()
       .prepare(
         `UPDATE ce_sessions SET
            status = ?, currentQuestion = ?, conversationHistory = ?, projectId = ?,
@@ -277,8 +329,15 @@ export class CeSessionStore {
 
   /** Delete a session row. Returns true when a row was removed. */
   delete(id: string): boolean {
-    const result = this.db.prepare(`DELETE FROM ce_sessions WHERE id = ?`).run(id);
-    return Number(result.changes ?? 0) > 0;
+    const db = this.syncDb();
+    return db.transactionImmediate(() => {
+      const result = db.prepare(`DELETE FROM ce_sessions WHERE id = ?`).run(id);
+      if (Number(result.changes ?? 0) > 0) {
+        db.prepare("DELETE FROM ce_plan_handoff_claims WHERE sessionId = ?").run(id);
+        return true;
+      }
+      return false;
+    });
   }
 
   /** Append a turn to the conversation history (no other field touched). */
@@ -340,7 +399,10 @@ export function getCeSessionStore(ctx: PluginContext): CeSessionStore {
   const key = ctx.taskStore as object;
   const cached = storeCache.get(key);
   if (cached) return cached;
-  const store = new CeSessionStore(ctx.taskStore.getDatabase());
+  // FNXC:RuntimeSatelliteAsync 2026-06-24-22:40:
+  // In backend mode, getDatabase() throws. Guard with isBackendMode() check.
+  const db = ctx.taskStore.isBackendMode() ? null : ctx.taskStore.getDatabase();
+  const store = new CeSessionStore(db);
   storeCache.set(key, store);
   return store;
 }

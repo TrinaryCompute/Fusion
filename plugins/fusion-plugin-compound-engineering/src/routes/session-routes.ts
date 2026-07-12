@@ -59,6 +59,7 @@ export function createSessionRoutes(): PluginRouteDefinition[] {
           const result = await orch.start(stageId, {
             openingMessage,
             projectId: asString(body?.projectId) ?? null,
+            sourceSessionId: asString(body?.sourceSessionId),
             detach: true,
           });
           return { status: 201, body: { session: result.session } };
@@ -137,13 +138,18 @@ export function createSessionRoutes(): PluginRouteDefinition[] {
     {
       method: "GET",
       path: "/sessions",
-      description: "List CE sessions (optionally filtered by status/stage).",
+      description: "List CE sessions (optionally filtered by project/status/stage).",
       handler: async (req: unknown, ctx: PluginContext): Promise<PluginRouteResponse> => {
         recoverStaleSessionsForContext(ctx, { reason: "route" });
         const query = (req as RouteRequest).query ?? {};
         const status = asCeSessionStatus(typeof query.status === "string" ? query.status : undefined);
         const stage = typeof query.stage === "string" ? query.stage : undefined;
-        const sessions = getCeSessionStore(ctx).list({ status, stage });
+        const projectId = typeof query.projectId === "string" ? query.projectId : undefined;
+        /*
+        FNXC:CompoundEngineering 2026-07-10-23:40:
+        Dashboard session collections must be scoped at the route/store boundary so resume, URL restoration, stage state, and history cannot expose another project's Compound Engineering runs.
+        */
+        const sessions = getCeSessionStore(ctx).list({ status, stage, projectId });
         return { status: 200, body: { sessions } };
       },
     },
@@ -170,7 +176,7 @@ export function createSessionRoutes(): PluginRouteDefinition[] {
       description: "List the CE pipeline-link records (work→board) for a session/pipeline.",
       handler: async (req: unknown, ctx: PluginContext): Promise<PluginRouteResponse> => {
         const id = (req as RouteRequest).params.id;
-        const links = getCePipelineStore(ctx).listByPipeline(id);
+        const links = await getCePipelineStore(ctx).listByPipelineAsync(id);
         return { status: 200, body: { links } };
       },
     },

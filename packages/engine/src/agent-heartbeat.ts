@@ -544,7 +544,7 @@ You have coding-capable workspace tools (read/write/edit/bash within worktree bo
 - fn_list_agents and fn_delegate_task
 - fn_get_agent_config and fn_update_agent_config (for direct reports only)
 - fn_agent_create and fn_agent_delete (for direct reports only)
-- fn_artifact_register, fn_artifact_list, and fn_artifact_view
+- fn_artifact_register, fn_artifact_list, and fn_artifact_view (register visual/media outputs so they appear in the dashboard Artifacts gallery: screenshots/wireframes/mockups/diagrams as type="image" via \`path\`; screen recordings as type="video" via \`path\`; HTML mockups as type="document" with mimeType="text/html" — rendered as live previews; PDFs as type="document" with mimeType="application/pdf" via \`path\`. No-task runs have no session workspace directory, so save files under the OS temp directory and pass an absolute \`path\` — relative paths are rejected in this mode)
 - fn_read_evaluations and fn_update_identity (available in no-task runs)
 - fn_reflect_on_performance when reflection is enabled for this run
 - fn_workflow_list, fn_workflow_get, fn_workflow_create, fn_workflow_update, fn_workflow_delete, fn_workflow_settings, and fn_trait_list for workflow discovery/authoring
@@ -1028,7 +1028,7 @@ export class HeartbeatMonitor {
           continue;
         }
 
-        const roomTimeline = this.chatStore.getRoomMessages(entry.room.id, { limit: 100 });
+        const roomTimeline = await this.chatStore.getRoomMessages(entry.room.id, { limit: 100 });
         const messageIndex = roomTimeline.findIndex((roomMessage) => roomMessage.id === message.id);
         if (messageIndex <= 0) {
           continue;
@@ -1089,12 +1089,12 @@ export class HeartbeatMonitor {
             continue;
           }
 
-          const members = this.chatStore.listRoomMembers(entry.room.id);
+          const members = await this.chatStore.listRoomMembers(entry.room.id);
           if (countActiveAgentMembers(members) < 2) {
             continue;
           }
 
-          const roomTimeline = this.chatStore.getRoomMessages(entry.room.id, { limit: 100 });
+          const roomTimeline = await this.chatStore.getRoomMessages(entry.room.id, { limit: 100 });
           const messageIndex = roomTimeline.findIndex((roomMessage) => roomMessage.id === message.id);
           if (messageIndex < 0) {
             continue;
@@ -1159,14 +1159,14 @@ export class HeartbeatMonitor {
     }
 
     try {
-      const rooms = this.chatStore.listRoomsForAgent(agent.id, { status: "active" });
+      const rooms = await this.chatStore.listRoomsForAgent(agent.id, { status: "active" });
       const entries: Array<{ room: ChatRoom; messages: ChatRoomMessage[] }> = [];
       let total = 0;
       let surfaced = 0;
       let truncatedCount = 0;
 
       for (const room of rooms) {
-        const messages = this.chatStore.listRoomMessagesSince(room.id, sinceIso, {
+        const messages = await this.chatStore.listRoomMessagesSince(room.id, sinceIso, {
           excludeSenderAgentId: agent.id,
           limit: 10,
         });
@@ -1199,7 +1199,8 @@ export class HeartbeatMonitor {
       if (!this.taskStore) {
         throw new Error("HeartbeatMonitor missing taskStore for approval request persistence");
       }
-      this.approvalRequestStore = new ApprovalRequestStore(this.taskStore.getDatabase());
+      const layer = this.taskStore.getAsyncLayer();
+      this.approvalRequestStore = new ApprovalRequestStore(layer ? null : this.taskStore.getDatabase(), { asyncLayer: layer });
     }
     return this.approvalRequestStore;
   }
@@ -1213,7 +1214,7 @@ export class HeartbeatMonitor {
       taskId,
       runId,
       permissionPolicy: policy,
-      createApprovalRequest: async (decision, args) => this.getApprovalRequestStore().create({
+      createApprovalRequest: async (decision, args) => await this.getApprovalRequestStore().create({
         requester: { actorId: agent.id, actorType: "agent", actorName: agent.name },
         taskId,
         runId,
@@ -1227,11 +1228,11 @@ export class HeartbeatMonitor {
         },
       }),
       findApprovalByDedupeKey: async (dedupeKey) => {
-        const latest = this.getApprovalRequestStore().findLatestByDedupeKey({ requesterActorId: agent.id, taskId, dedupeKey });
+        const latest = await this.getApprovalRequestStore().findLatestByDedupeKey({ requesterActorId: agent.id, taskId, dedupeKey });
         return latest ? { id: latest.id, status: latest.status } : null;
       },
       findPendingApprovalByDedupeKey: async (dedupeKey) => {
-        const latest = this.getApprovalRequestStore().findLatestByDedupeKey({ requesterActorId: agent.id, taskId, dedupeKey });
+        const latest = await this.getApprovalRequestStore().findLatestByDedupeKey({ requesterActorId: agent.id, taskId, dedupeKey });
         return latest?.status === "pending" ? { id: latest.id } : null;
       },
       /*
@@ -1284,7 +1285,7 @@ export class HeartbeatMonitor {
       // payload-bearing (shared helper) and `approvalDedupeKey`/`command`/`cwd`
       // are persisted into targetAction.context so findPendingApprovalRequest
       // can match and the UI can render the payload without re-parsing.
-      createApprovalRequest: async ({ category, toolName, args, approvalDedupeKey }) => this.getApprovalRequestStore().create({
+      createApprovalRequest: async ({ category, toolName, args, approvalDedupeKey }) => await this.getApprovalRequestStore().create({
         requester: { actorId: agent.id, actorType: "agent", actorName: agent.name },
         taskId,
         runId,
@@ -1309,7 +1310,7 @@ export class HeartbeatMonitor {
         },
       }),
       findPendingApprovalRequest: async (dedupeKey) => {
-        const pending = this.getApprovalRequestStore().list({ status: "pending", requesterActorId: agent.id, taskId, limit: 100 });
+        const pending = await this.getApprovalRequestStore().list({ status: "pending", requesterActorId: agent.id, taskId, limit: 100 });
         return pending.find((request) => request.targetAction.context?.approvalDedupeKey === dedupeKey) ?? null;
       },
     };
@@ -1960,12 +1961,33 @@ export class HeartbeatMonitor {
     return this.trackedAgents.get(agentId)?.lastSeen;
   }
 
-  private handleMessageToAgent(message: Message): void {
+  /**
+   * FNXC:PostgresBackend 2026-06-28-10:20:
+   * Wake-on-message delivery hook fired by MessageStore on an agent-directed send.
+   * Now async + PG-capable: it reads the recipient agent via the AgentStore's async
+   * `getAgent` (the previous sync `getCachedAgent`/`readAgent` threw in PG backend
+   * mode, leaving the agent un-woken even though the send succeeded). Self-catching:
+   * this is a fire-and-forget hook the send does not depend on, so any rejection is
+   * logged and swallowed here (MessageStore also awaits inside its own try/catch),
+   * guaranteeing a wake failure can neither fail the send nor surface as an
+   * unhandledRejection. Wake/skip semantics (response-mode gate, forced-wake rule,
+   * valid-state gate) are unchanged.
+   */
+  private async handleMessageToAgent(message: Message): Promise<void> {
+    try {
+      await this.deliverMessageToAgent(message);
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      heartbeatLog.warn(`Wake-on-message delivery failed for ${message.toId}: ${errorMessage}`);
+    }
+  }
+
+  private async deliverMessageToAgent(message: Message): Promise<void> {
     if (message.toType !== "agent") {
       return;
     }
 
-    const agent = this.configStore.getCachedAgent(message.toId);
+    const agent = await this.configStore.getAgent(message.toId);
     if (!agent) {
       return;
     }
@@ -2790,6 +2812,21 @@ export class HeartbeatMonitor {
           }
         }
 
+        /*
+        FNXC:ArtifactRegistry 2026-07-11-09:55:
+        Task-scoped heartbeat tools are built before the worktree is acquired, so the initial
+        fn_artifact_register binding has no baseDir and would reject relative artifact paths.
+        Once the acquired worktree cwd is known, rebind the tool with `baseDir: sessionCwd` so
+        relative `path` payloads resolve inside the heartbeat worktree (never process.cwd())
+        and absolute paths are contained to that worktree or the OS temp directory.
+        */
+        if (!isNoTaskRun) {
+          const registerToolIndex = heartbeatTools.findIndex((tool) => tool.name === "fn_artifact_register");
+          if (registerToolIndex >= 0) {
+            heartbeatTools[registerToolIndex] = createArtifactRegisterTool(taskStore, agentId, this.messageStore, { baseDir: sessionCwd, defaultTaskId: taskId! });
+          }
+        }
+
         const heartbeatSessionModels = resolveHeartbeatSessionModels(heartbeatModelSettings, agent.runtimeConfig);
         /*
          * FNXC:McpConfig 2026-06-26-00:00:
@@ -2869,7 +2906,7 @@ export class HeartbeatMonitor {
           // Fetch unread messages when messageStore is available (for all trigger types)
           if (this.messageStore) {
             try {
-              pendingMessages = this.messageStore.getInbox(agentId, "agent", { read: false, limit: 10 });
+              pendingMessages = await this.messageStore.getInbox(agentId, "agent", { read: false, limit: 10 });
             } catch (inboxErr) {
               heartbeatLog.warn(`Failed to fetch inbox messages for ${agentId}: ${inboxErr instanceof Error ? inboxErr.message : String(inboxErr)}`);
             }
@@ -3244,7 +3281,7 @@ export class HeartbeatMonitor {
           // Mark messages as read after successful processing (only if messages were included in prompt)
           if (pendingMessages.length > 0 && this.messageStore) {
             try {
-              this.messageStore.markAllAsRead(agentId, "agent");
+              await this.messageStore.markAllAsRead(agentId, "agent");
             } catch (markReadErr) {
               heartbeatLog.warn(`Failed to mark messages as read for ${agentId}: ${markReadErr instanceof Error ? markReadErr.message : String(markReadErr)}`);
             }
@@ -3426,16 +3463,15 @@ export class HeartbeatMonitor {
       let intervalSource: "runtimeConfig" | "persisted-agent" | "monitor-default" = "monitor-default";
 
       try {
-        const cachedAgent = this.configStore.getCachedAgent?.(report.id);
-        if (cachedAgent?.runtimeConfig && typeof cachedAgent.runtimeConfig.heartbeatIntervalMs === "number" && Number.isFinite(cachedAgent.runtimeConfig.heartbeatIntervalMs)) {
-          pollIntervalMs = Math.max(1000, cachedAgent.runtimeConfig.heartbeatIntervalMs);
+        // Async lookup — works in both SQLite and PG backend modes. Previously
+        // tried sync getCachedAgent first (returns null in PG mode); the async
+        // path is now the single source of truth.
+        const agent = typeof storeWithReports.getAgent === "function"
+          ? await storeWithReports.getAgent(report.id)
+          : (this.configStore.getCachedAgent?.(report.id) ?? null);
+        if (agent?.runtimeConfig && typeof agent.runtimeConfig.heartbeatIntervalMs === "number" && Number.isFinite(agent.runtimeConfig.heartbeatIntervalMs)) {
+          pollIntervalMs = Math.max(1000, agent.runtimeConfig.heartbeatIntervalMs);
           intervalSource = "runtimeConfig";
-        } else if (typeof storeWithReports.getAgent === "function") {
-          const persisted = await storeWithReports.getAgent(report.id);
-          if (persisted?.runtimeConfig && typeof persisted.runtimeConfig.heartbeatIntervalMs === "number" && Number.isFinite(persisted.runtimeConfig.heartbeatIntervalMs)) {
-            pollIntervalMs = Math.max(1000, persisted.runtimeConfig.heartbeatIntervalMs);
-            intervalSource = "persisted-agent";
-          }
         }
       } catch (reportsHealthConfigErr) {
         heartbeatLog.warn(`[reports-health] failed to resolve interval for ${report.id}: ${reportsHealthConfigErr instanceof Error ? reportsHealthConfigErr.message : String(reportsHealthConfigErr)} — using monitor-default`);
@@ -3629,7 +3665,8 @@ export class HeartbeatMonitor {
     tools.push(createTaskDocumentWriteTool(taskStore, taskId));
     tools.push(createTaskDocumentReadTool(taskStore, taskId));
     // Artifact registry tools for cross-agent deliverable discovery and notification.
-    tools.push(createArtifactRegisterTool(taskStore, agentId, messageStore));
+    // FNXC:ArtifactRegistry 2026-07-10-14:30: task-scoped heartbeat registrations default to the assigned task so agent-produced media lands in that task's Artifacts tab.
+    tools.push(createArtifactRegisterTool(taskStore, agentId, messageStore, { defaultTaskId: taskId }));
     tools.push(createArtifactListTool(taskStore));
     tools.push(createArtifactViewTool(taskStore));
     // Agent delegation tools — discover and delegate work to other agents
@@ -3687,10 +3724,47 @@ export class HeartbeatMonitor {
   }
 
   /**
-   * Resolve per-agent heartbeat config from runtimeConfig with validation and fallbacks.
+   * Apply an agent's runtimeConfig overrides to a config result (pre-multiplier).
+   * Shared between the sync resolveAgentConfig (SQLite getCachedAgent) and the
+   * async getAgentConfig (PG-capable getAgent) paths.
+   */
+  private applyAgentRuntimeConfig(
+    agent: { runtimeConfig?: Record<string, unknown> } | null | undefined,
+    result: ResolvedHeartbeatConfig,
+  ): void {
+    if (!agent?.runtimeConfig) return;
+    const rc = agent.runtimeConfig;
+    if (typeof rc.heartbeatIntervalMs === "number" && Number.isFinite(rc.heartbeatIntervalMs)) {
+      result.pollIntervalMs = Math.max(1000, rc.heartbeatIntervalMs);
+    }
+    if (typeof rc.heartbeatTimeoutMs === "number" && Number.isFinite(rc.heartbeatTimeoutMs)) {
+      result.heartbeatTimeoutMs = Math.max(5000, rc.heartbeatTimeoutMs);
+    }
+    if (typeof rc.maxConcurrentRuns === "number" && Number.isFinite(rc.maxConcurrentRuns)) {
+      result.maxConcurrentRuns = Math.max(1, Math.round(rc.maxConcurrentRuns));
+    }
+  }
+
+  /**
+   * Apply the cached heartbeat-memory multiplier to poll interval and timeout.
+   * Used by both sync and async config resolvers so isAgentHealthy (sync) and
+   * checkMissedHeartbeats (async) apply the same scaling.
+   */
+  private applyCachedMultiplier(result: ResolvedHeartbeatConfig): void {
+    const multiplier = this.cachedHeartbeatMultiplierAt > 0 ? this.cachedHeartbeatMultiplier : 1;
+    result.pollIntervalMs = Math.max(1000, Math.round(result.pollIntervalMs * multiplier));
+    result.heartbeatTimeoutMs = Math.max(5000, Math.round(result.heartbeatTimeoutMs * multiplier));
+  }
+
+  /**
+   * Resolve per-agent heartbeat config synchronously (SQLite fast-path).
+   *
+   * In PG backend mode getCachedAgent returns null (no sync DB handle), so this
+   * degrades to monitor defaults — used only by sync callers like isAgentHealthy.
+   * The async getAgentConfig() path does its own async getAgent() lookup and is
+   * the authoritative source for per-agent runtimeConfig in PG mode.
    */
   private resolveAgentConfig(agentId: string): ResolvedHeartbeatConfig {
-    // Defaults from monitor-level construction
     const result: ResolvedHeartbeatConfig = {
       pollIntervalMs: this.pollIntervalMs,
       heartbeatTimeoutMs: this.heartbeatTimeoutMs,
@@ -3698,30 +3772,13 @@ export class HeartbeatMonitor {
     };
 
     try {
-      const agent = this.configStore.getCachedAgent?.(agentId);
-      if (agent?.runtimeConfig) {
-        const rc = agent.runtimeConfig;
-
-        if (typeof rc.heartbeatIntervalMs === "number" && Number.isFinite(rc.heartbeatIntervalMs)) {
-          result.pollIntervalMs = Math.max(1000, rc.heartbeatIntervalMs);
-        }
-        if (typeof rc.heartbeatTimeoutMs === "number" && Number.isFinite(rc.heartbeatTimeoutMs)) {
-          result.heartbeatTimeoutMs = Math.max(5000, rc.heartbeatTimeoutMs);
-        }
-        if (typeof rc.maxConcurrentRuns === "number" && Number.isFinite(rc.maxConcurrentRuns)) {
-          result.maxConcurrentRuns = Math.max(1, Math.round(rc.maxConcurrentRuns));
-        }
-      }
+      // Sync SQLite read — null in PG backend mode. Sync callers safely degrade.
+      this.applyAgentRuntimeConfig(this.configStore.getCachedAgent?.(agentId), result);
     } catch (agentLookupErr) {
-      heartbeatLog.warn(`getAgentConfig(${agentId}) agent lookup failed: ${agentLookupErr instanceof Error ? agentLookupErr.message : String(agentLookupErr)} — using monitor defaults`);
+      heartbeatLog.warn(`resolveAgentConfig(${agentId}) agent lookup failed: ${agentLookupErr instanceof Error ? agentLookupErr.message : String(agentLookupErr)} — using monitor defaults`);
     }
 
-    // Sync health checks (isAgentHealthy / orphan reconcile / reports-health)
-    // are best-effort and use the most recent async-loaded multiplier cache.
-    const multiplier = this.cachedHeartbeatMultiplierAt > 0 ? this.cachedHeartbeatMultiplier : 1;
-    result.pollIntervalMs = Math.max(1000, Math.round(result.pollIntervalMs * multiplier));
-    result.heartbeatTimeoutMs = Math.max(5000, Math.round(result.heartbeatTimeoutMs * multiplier));
-
+    this.applyCachedMultiplier(result);
     return result;
   }
 
@@ -3737,7 +3794,23 @@ export class HeartbeatMonitor {
   }
 
   private async getAgentConfig(agentId: string): Promise<ResolvedHeartbeatConfig> {
-    const result = this.resolveAgentConfig(agentId);
+    const result: ResolvedHeartbeatConfig = {
+      pollIntervalMs: this.pollIntervalMs,
+      heartbeatTimeoutMs: this.heartbeatTimeoutMs,
+      maxConcurrentRuns: this.maxConcurrentRuns,
+    };
+
+    // Async agent lookup — works in both SQLite and PG backend modes. This
+    // replaces the previous reliance on the sync resolveAgentConfig() (whose
+    // getCachedAgent returns null in PG mode, losing per-agent runtimeConfig).
+    try {
+      const agent = await this.configStore.getAgent?.(agentId);
+      this.applyAgentRuntimeConfig(agent, result);
+    } catch (agentLookupErr) {
+      heartbeatLog.warn(`getAgentConfig(${agentId}) agent lookup failed: ${agentLookupErr instanceof Error ? agentLookupErr.message : String(agentLookupErr)} — using monitor defaults`);
+    }
+
+    this.applyCachedMultiplier(result);
 
     if (!this.taskStore) {
       return result;

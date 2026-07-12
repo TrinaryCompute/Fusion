@@ -851,6 +851,14 @@ The terminal header pop-out/dock affordance is an icon-only utility control. It 
   color: var(--text-muted);
 }
 
+/*
+FNXC:TerminalHeader 2026-07-11-18:45:
+FN-7823: viewport-based terminal breakpoints keep narrow floating/docked panels on the desktop header layout, so the header help text must stay on one line and let .terminal-actions use the FN-7550 min-width: 0 + overflow-x scroll pattern instead of wrapping the header.
+*/
+.terminal-shortcuts--header {
+  white-space: nowrap;
+}
+
 .terminal-shortcuts kbd {
   display: inline-block;
   padding: 2px 6px;
@@ -1254,6 +1262,7 @@ The shortcut bar (modifier keys + arrow keys) must sit on ONE line, not stack in
 
 .terminal-connection-status {
   font-weight: 500;
+  white-space: nowrap;
 }
 
 .terminal-connection-status.connected {
@@ -1822,5 +1831,56 @@ reapply the mobile-only `.terminal-shortcuts--header, .terminal-connection-statu
     overflow-x: auto;
     scrollbar-width: thin;
     touch-action: pan-x pan-y;
+  }
+}
+
+/*
+FNXC:Terminal 2026-07-10-00:00:
+FN-7813 embeds the shared terminal inside Task Detail. The host must fill the parent tab panel, keep scroll/resize inside the terminal surface, and avoid overlay/floating dimensions so Task Detail owns layout at every breakpoint.
+*/
+.terminal-embedded-host {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+  overflow: hidden;
+  background: var(--surface);
+  border: thin solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.modal.terminal-modal.terminal-modal--embedded {
+  position: relative;
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  max-width: none;
+  max-height: none;
+  height: auto;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  resize: none;
+}
+
+.terminal-modal--embedded .terminal-header {
+  flex-wrap: wrap;
+  gap: var(--space-sm);
+}
+
+@media (max-width: 768px) {
+  .terminal-embedded-host {
+    border-radius: var(--radius-md);
+  }
+
+  .terminal-modal--embedded .terminal-header {
+    align-items: stretch;
+  }
+
+  .terminal-modal--embedded .terminal-tabs,
+  .terminal-modal--embedded .terminal-workspace-picker,
+  .terminal-modal--embedded .terminal-actions {
+    min-width: 0;
   }
 }

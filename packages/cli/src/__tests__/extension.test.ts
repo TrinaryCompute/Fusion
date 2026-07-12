@@ -1,8 +1,7 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
-import { dirname, join, relative } from "node:path";
+import { join, relative } from "node:path";
 import { tmpdir } from "node:os";
-import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 
 /*
@@ -22,79 +21,62 @@ vi.mock("../commands/task.js", () => ({
   runTaskPlan: vi.fn(),
 }));
 
-import kbExtension, { closeCachedStores, resolveTaskListFormatter } from "../extension.js";
-import { TaskStore, AgentStore, MANUAL_RETRY_RESET_COUNTER_KEYS, RESEARCH_RUN_STATUSES, MAX_TASK_LIST_TEXT_CHARS, formatTaskListText, COLUMN_LABELS } from "@fusion/core";
+import { resolveTaskListFormatter } from "../extension.js";
+import { TaskStore, AgentStore, MANUAL_RETRY_RESET_COUNTER_KEYS, RESEARCH_RUN_STATUSES, MAX_TASK_LIST_TEXT_CHARS, formatTaskListText, COLUMN_LABELS, drizzleSql } from "@fusion/core";
 import type { WorkflowIr } from "@fusion/core";
 import { isGhAvailable, isGhAuthenticated, runGhJsonAsync } from "@fusion/core/gh-cli";
 import { runTaskPlan } from "../commands/task.js";
+import { pgDescribe } from "../../../core/src/__test-utils__/pg-test-harness.js";
+import {
+  createPgExtensionHarness,
+  createMockApi,
+  registerExtension,
+  requireTool,
+  type MockApi,
+  type ToolExecuteContext,
+  type ToolResult,
+  type ToolResultContent,
+} from "./pg-extension-harness.js";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
+/**
+ * FNXC:PostgresCutover 2026-07-04-00:00:
+ * Migrated from the legacy SQLite `new TaskStore(rootDir)` harness to a shared
+ * PostgreSQL extension harness. Store construction goes through `h.store()`,
+ * tool calls use `cwd: h.rootDir()`, and state is read via async store methods.
+ */
+const pgTest = pgDescribe;
+const h = createPgExtensionHarness("fn-extension");
 
-// ── Mock ExtensionAPI that captures registrations ──────────────────
 
-interface RegisteredTool {
-  name: string;
-  label: string;
-  description: string;
-  execute: (
-    toolCallId: string,
-    params: any,
-    signal: AbortSignal | undefined,
-    onUpdate: ((update: any) => void) | undefined,
-    ctx: any,
-  ) => Promise<any>;
+function makeCtx(cwd: string): ToolExecuteContext {
+  return { cwd };
 }
-
-interface RegisteredCommand {
-  description: string;
-  handler: (args: string, ctx: any) => Promise<void>;
+interface ToolMeta {
+  description?: string;
+  promptGuidelines?: string[];
 }
-
-function createMockAPI() {
-  const tools = new Map<string, RegisteredTool>();
-  const commands = new Map<string, RegisteredCommand>();
-  const events = new Map<string, Function>();
-
-  const api = {
-    registerTool(def: any) {
-      tools.set(def.name, def);
-    },
-    registerCommand(name: string, def: any) {
-      commands.set(name, def);
-    },
-    registerShortcut: vi.fn(),
-    registerFlag: vi.fn(),
-    on(event: string, handler: Function) {
-      events.set(event, handler);
-    },
-    tools,
-    commands,
-    events,
-  };
-
-  return api as any;
+interface ToolParameterSchema {
+  enum?: unknown[];
+  anyOf?: { const?: string; enum?: unknown[] }[];
 }
-
-function makeCtx(cwd: string) {
-  return { cwd } as any;
+interface ToolWithParameters {
+  parameters?: { properties?: Record<string, ToolParameterSchema> };
 }
 
 async function seedAgent(
   cwd: string,
   overrides: { ephemeral?: boolean; name?: string } = {},
 ): Promise<string> {
-  const agentStore = new AgentStore({ rootDir: join(cwd, ".fusion") });
+  // FNXC:PostgresCutover: seed via the PG asyncLayer so AgentStore runs in
+  // backend mode (the SQLite Database class body has been removed).
+  const agentStore = new AgentStore({ rootDir: join(cwd, ".fusion"), asyncLayer: h.store().getAsyncLayer() });
   await agentStore.init();
-  try {
-    const agent = await agentStore.createAgent({
-      name: overrides.name ?? "test-agent",
-      role: "executor",
-      metadata: overrides.ephemeral ? { agentKind: "task-worker" } : {},
-    });
-    return agent.id;
-  } finally {
-    agentStore.close();
-  }
+  const agent = await agentStore.createAgent({
+    name: overrides.name ?? "test-agent",
+    role: "executor",
+    metadata: overrides.ephemeral ? { agentKind: "task-worker" } : {},
+  });
+  return agent.id;
 }
 
 function linearWorkflowIr(name: string): WorkflowIr {
@@ -134,58 +116,21 @@ function linearWorkflowIr(name: string): WorkflowIr {
   };
 }
 
-async function seedWorkflow(cwd: string, name = "QA workflow"): Promise<string> {
-  const store = new TaskStore(cwd);
-  await store.init();
-  try {
-    const workflow = await store.createWorkflowDefinition({ name, ir: linearWorkflowIr(name) });
-    return workflow.id;
-  } finally {
-    await store.close();
-  }
+async function seedWorkflow(_cwd: string, name = "QA workflow"): Promise<string> {
+  const store = h.store();
+  const workflow = await store.createWorkflowDefinition({ name, ir: linearWorkflowIr(name) });
+  return workflow.id;
 }
 
-async function readTaskWorkflowState(cwd: string, taskId: string) {
-  const store = new TaskStore(cwd);
-  await store.init();
-  try {
-    const task = await store.getTask(taskId);
-    const selection = store.getTaskWorkflowSelection(taskId);
-    return { task, selection };
-  } finally {
-    await store.close();
-  }
+async function readTaskWorkflowState(_cwd: string, taskId: string) {
+  const store = h.store();
+  const task = await store.getTask(taskId);
+  const selection = await store.getTaskWorkflowSelectionAsync(taskId);
+  return { task, selection };
 }
 
-async function removeDirWithRetries(path: string) {
-  /*
-  FNXC:CliTests 2026-06-19-11:23:
-  FN-6734 showed fixture removal can race SQLite/WAL close on loaded CLI workers; retry cleanup long enough for handles to drain instead of masking test bodies with larger timeouts or worker limits.
-  */
-  const maxAttempts = 12;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    try {
-      await rm(path, { recursive: true, force: true });
-      return;
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code !== "ENOTEMPTY" && code !== "EBUSY") {
-        throw error;
-      }
-
-      if (attempt === maxAttempts) {
-        throw error;
-      }
-
-      await delay(50 * attempt);
-    }
-  }
-}
-
-async function enableResearch(cwd: string): Promise<TaskStore> {
-  const store = new TaskStore(cwd);
-  await store.init();
+async function enableResearch(_cwd: string): Promise<TaskStore> {
+  const store = h.store();
   await store.updateGlobalSettings({
     researchGlobalEnabled: true,
     researchGlobalDefaults: { searchProvider: "searxng" },
@@ -203,35 +148,28 @@ async function enableResearch(cwd: string): Promise<TaskStore> {
 
 // ── Tests ──────────────────────────────────────────────────────────
 
-describe("fn pi extension tool copy guardrails", () => {
+pgTest("fn pi extension tool copy guardrails", () => {
   it("describes fn_task_delete as soft delete and avoids irrecoverability claims (FN-5141)", () => {
-    const api = createMockAPI();
-    kbExtension(api);
+    const api = createMockApi();
+    registerExtension(api);
 
-    const tool = api.tools.get("fn_task_delete") as
-      | { description?: string; promptGuidelines?: string[] }
-      | undefined;
+    const tool = requireTool(api, "fn_task_delete") as unknown as ToolMeta;
 
-    expect(tool).toBeDefined();
-    expect(tool?.description ?? "").not.toMatch(/permanent|cannot be recovered|cannot be undone|deleted immediately/i);
-    expect(tool?.description ?? "").toMatch(/soft.?delete/i);
+    expect(tool.description ?? "").not.toMatch(/permanent|cannot be recovered|cannot be undone|deleted immediately/i);
+    expect(tool.description ?? "").toMatch(/soft.?delete/i);
 
-    const guidelines = (tool?.promptGuidelines ?? []).join(" ");
+    const guidelines = (tool.promptGuidelines ?? []).join(" ");
     expect(guidelines).toMatch(/soft.?delete/i);
     expect(guidelines).not.toMatch(/permanent|cannot be recovered|cannot be undone|deleted immediately|irrecoverable/i);
   });
 
   it("describes fn_agent_stop as allowing error-state agents to be paused (FN-6018)", () => {
-    const api = createMockAPI();
-    kbExtension(api);
+    const api = createMockApi();
+    registerExtension(api);
 
-    const tool = api.tools.get("fn_agent_stop") as
-      | { description?: string; promptGuidelines?: string[] }
-      | undefined;
+    const tool = requireTool(api, "fn_agent_stop") as unknown as ToolMeta;
 
-    expect(tool).toBeDefined();
-
-    const guidelines = (tool?.promptGuidelines ?? []).join(" ");
+    const guidelines = (tool.promptGuidelines ?? []).join(" ");
     expect(guidelines).toMatch(/running, active, or in error/i);
     expect(guidelines).toMatch(/idle.*already-paused/i);
     expect(guidelines).not.toMatch(/idle, 'error', or already-paused/i);
@@ -247,9 +185,23 @@ const SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION =
   process.env.FUSION_TEST_LEGACY_EXTENSION_INTEGRATION === "1" ||
   process.env.FUSION_TEST_LEGACY_EXTENSION_INTEGRATION === "true";
 
-describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (legacy exhaustive suite)", () => {
+const legacyDescribe = SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION ? pgTest : describe.skip;
+
+legacyDescribe("fn pi extension (legacy exhaustive suite)", () => {
   let tmpDir: string;
-  let api: ReturnType<typeof createMockAPI>;
+  // The legacy registration its also read commands/events; the harness MockApi
+  // only tracks tools, so cast once at this boundary for those reads. The whole
+  // suite stays gated off by default (legacyDescribe === describe.skip).
+  type LegacyApi = MockApi & {
+    commands: Map<string, { description: string }>;
+    events: Map<string, unknown>;
+  };
+  let api: LegacyApi;
+
+  beforeAll(h.beforeAll);
+  beforeEach(h.beforeEach);
+  afterEach(h.afterEach);
+  afterAll(h.afterAll);
 
   beforeEach(async () => {
     vi.mocked(isGhAvailable).mockReturnValue(true);
@@ -257,15 +209,11 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
     vi.mocked(runGhJsonAsync).mockReset();
     vi.mocked(runTaskPlan).mockReset();
 
-    tmpDir = await mkdtemp(join(tmpdir(), "kb-ext-test-"));
-    await mkdir(join(tmpDir, ".fusion"), { recursive: true });
-    api = createMockAPI();
-    kbExtension(api);
-  });
-
-  afterEach(async () => {
-    await closeCachedStores();
-    await removeDirWithRetries(tmpDir);
+    tmpDir = h.rootDir();
+    api = createMockApi() as unknown as LegacyApi;
+    registerExtension(api);
+    // FNXC:PostgresCutover: pin the "FN" task prefix (PG allocator defaults to "KB").
+    await h.store().updateSettings({ taskPrefix: "FN" });
   });
 
   describe("registration", () => {
@@ -434,12 +382,10 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
 
     it("creates a task without workflow_id using the project default workflow", async () => {
       const workflowId = await seedWorkflow(tmpDir, "Default create workflow");
-      const store = new TaskStore(tmpDir);
-      await store.init();
+      const store = h.store();
       try {
         await store.setDefaultWorkflowId(workflowId);
       } finally {
-        await store.close();
       }
 
       const tool = api.tools.get("fn_task_create")!;
@@ -763,9 +709,9 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
     });
 
     it("rejects invalid priority value", () => {
-      const updateTool = api.tools.get("fn_task_update") as any;
-      const prioritySchema = updateTool.parameters.properties.priority;
-      const literalValues = prioritySchema.anyOf.map((entry: { const: string }) => entry.const);
+      const updateTool = requireTool(api, "fn_task_update") as unknown as ToolWithParameters;
+      const prioritySchema = updateTool.parameters?.properties?.priority;
+      const literalValues = (prioritySchema?.anyOf ?? []).map((entry) => entry.const);
       expect(literalValues).toEqual(["low", "normal", "high", "urgent"]);
       expect(literalValues).not.toContain("critical");
     });
@@ -1016,8 +962,7 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
     });
 
     it("includes concise provenance in list rows", async () => {
-      const store = new TaskStore(tmpDir);
-      await store.init();
+      const store = h.store();
 
       await store.createTask({
         description: "Created by dashboard",
@@ -1116,8 +1061,7 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
     });
 
     it("shows agent and dashboard provenance", async () => {
-      const store = new TaskStore(tmpDir);
-      await store.init();
+      const store = h.store();
 
       await store.createTask({
         description: "Agent created",
@@ -1138,8 +1082,7 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
     });
 
     it("shows duplicate lineage with archived annotation", async () => {
-      const store = new TaskStore(tmpDir);
-      await store.init();
+      const store = h.store();
 
       const archivedSource = await store.createTask({ description: "Archived source" });
       await store.moveTask(archivedSource.id, "done");
@@ -1412,8 +1355,7 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
       expect(result.content[0].text).toContain("Test Mission");
       expect(result.content[0].text).toContain("Auto-advance: enabled");
 
-      const store = new TaskStore(tmpDir);
-      await store.init();
+      const store = h.store();
       const mission = store.getMissionStore().getMission(result.details.missionId);
       expect(mission?.baseBranch).toBe("develop");
     });
@@ -1445,16 +1387,14 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
     });
 
     it("includes mission interview drafts by default and exposes them in details", async () => {
-      const store = new TaskStore(tmpDir);
-      await store.init();
-      store.getDatabase().prepare(
-        `INSERT INTO ai_sessions (id, type, status, title, inputPayload, conversationHistory, currentQuestion, result, thinkingOutput, error, projectId, createdAt, updatedAt, lockedByTab, lockedAt)
-         VALUES (?, 'mission_interview', 'awaiting_input', ?, '{}', '[]', NULL, NULL, '', NULL, NULL, ?, ?, NULL, NULL)`,
-      ).run("draft-1", "Draft Mission", "2026-05-12T00:00:00.000Z", "2026-05-12T00:00:00.000Z");
-      store.getDatabase().prepare(
-        `INSERT INTO ai_sessions (id, type, status, title, inputPayload, conversationHistory, currentQuestion, result, thinkingOutput, error, projectId, createdAt, updatedAt, lockedByTab, lockedAt)
-         VALUES (?, 'mission_interview', 'complete', ?, '{}', '[]', NULL, '{}', '', NULL, NULL, ?, ?, NULL, NULL)`,
-      ).run("draft-2", "Ready Mission", "2026-05-12T00:01:00.000Z", "2026-05-12T00:01:00.000Z");
+      const store = h.store();
+      // FNXC:PostgresCutover: seed ai_sessions drafts via the PG async layer
+      // (the sync getDatabase() SQLite path is removed).
+      const db = store.getAsyncLayer()!.db;
+      await db.execute(drizzleSql`INSERT INTO project.ai_sessions (id, type, status, title, input_payload, conversation_history, current_question, result, thinking_output, error, project_id, created_at, updated_at, locked_by_tab, locked_at)
+        VALUES (${"draft-1"}, 'mission_interview', 'awaiting_input', ${"Draft Mission"}, ${"{}"}, ${"[]"}, NULL, NULL, ${""}, NULL, NULL, ${"2026-05-12T00:00:00.000Z"}, ${"2026-05-12T00:00:00.000Z"}, NULL, NULL)`);
+      await db.execute(drizzleSql`INSERT INTO project.ai_sessions (id, type, status, title, input_payload, conversation_history, current_question, result, thinking_output, error, project_id, created_at, updated_at, locked_by_tab, locked_at)
+        VALUES (${"draft-2"}, 'mission_interview', 'complete', ${"Ready Mission"}, ${"{}"}, ${"[]"}, NULL, ${"{}"}, ${""}, NULL, NULL, ${"2026-05-12T00:01:00.000Z"}, ${"2026-05-12T00:01:00.000Z"}, NULL, NULL)`);
 
       const listTool = api.tools.get("fn_mission_list")!;
       const result = await listTool.execute("call-1", {}, undefined, undefined, makeCtx(tmpDir));
@@ -1479,12 +1419,11 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
     });
 
     it("suppresses mission interview drafts when includeDrafts is false", async () => {
-      const store = new TaskStore(tmpDir);
-      await store.init();
-      store.getDatabase().prepare(
-        `INSERT INTO ai_sessions (id, type, status, title, inputPayload, conversationHistory, currentQuestion, result, thinkingOutput, error, projectId, createdAt, updatedAt, lockedByTab, lockedAt)
-         VALUES (?, 'mission_interview', 'error', ?, '{}', '[]', NULL, NULL, '', NULL, NULL, ?, ?, NULL, NULL)`,
-      ).run("draft-2", "Hidden Draft", "2026-05-12T00:00:00.000Z", "2026-05-12T00:00:00.000Z");
+      const store = h.store();
+      // FNXC:PostgresCutover: seed ai_sessions drafts via the PG async layer.
+      const db = store.getAsyncLayer()!.db;
+      await db.execute(drizzleSql`INSERT INTO project.ai_sessions (id, type, status, title, input_payload, conversation_history, current_question, result, thinking_output, error, project_id, created_at, updated_at, locked_by_tab, locked_at)
+        VALUES (${"draft-2"}, 'mission_interview', 'error', ${"Hidden Draft"}, ${"{}"}, ${"[]"}, NULL, NULL, ${""}, NULL, NULL, ${"2026-05-12T00:00:00.000Z"}, ${"2026-05-12T00:00:00.000Z"}, NULL, NULL)`);
 
       const listTool = api.tools.get("fn_mission_list")!;
       const result = await listTool.execute("call-1", { includeDrafts: false }, undefined, undefined, makeCtx(tmpDir));
@@ -1544,8 +1483,7 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
       const featureTool = api.tools.get("fn_feature_add")!;
       const mission = await missionTool.execute("m1", { title: "Mission" }, undefined, undefined, makeCtx(tmpDir));
 
-      const store = new TaskStore(tmpDir);
-      await store.init();
+      const store = h.store();
       const missionStore = store.getMissionStore();
       const milestone = missionStore.addMilestone(mission.details.missionId, {
         title: "Milestone",
@@ -1580,8 +1518,7 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
       const mission = await missionTool.execute("m1", { title: "Mission" }, undefined, undefined, makeCtx(tmpDir));
 
       const longValue = "LONG_AC_".repeat(40);
-      const store = new TaskStore(tmpDir);
-      await store.init();
+      const store = h.store();
       const missionStore = store.getMissionStore();
       missionStore.addMilestone(mission.details.missionId, {
         title: "Milestone",
@@ -1640,8 +1577,7 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
       const backfillTool = api.tools.get("fn_mission_backfill_assertions")!;
       const mission = await missionTool.execute("m1", { title: "Backfill Mission" }, undefined, undefined, makeCtx(tmpDir));
 
-      const store = new TaskStore(tmpDir);
-      await store.init();
+      const store = h.store();
       const missionStore = store.getMissionStore();
       const milestone = missionStore.addMilestone(mission.details.missionId, { title: "Milestone" });
       const slice = missionStore.addSlice(milestone.id, { title: "Slice" });
@@ -1714,8 +1650,7 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
         makeCtx(tmpDir),
       );
 
-      const store = new TaskStore(tmpDir);
-      await store.init();
+      const store = h.store();
       const persisted = store.getMissionStore().getMilestone(result.details.milestoneId);
 
       expect(result.content[0].text).toContain("Added");
@@ -1746,8 +1681,7 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
         makeCtx(tmpDir),
       );
 
-      const store = new TaskStore(tmpDir);
-      await store.init();
+      const store = h.store();
       const persisted = store.getMissionStore().getSlice(result.details.sliceId);
 
       expect(result.content[0].text).toContain("Added");
@@ -1786,8 +1720,7 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
         makeCtx(tmpDir),
       );
 
-      const store = new TaskStore(tmpDir);
-      await store.init();
+      const store = h.store();
       const persisted = store.getMissionStore().getFeature(result.details.featureId);
 
       expect(result.content[0].text).toContain("Added");
@@ -1887,8 +1820,7 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
         makeCtx(tmpDir),
       );
 
-      const store = new TaskStore(tmpDir);
-      await store.init();
+      const store = h.store();
       const persisted = store.getMissionStore().getSlice(slice.details.sliceId);
 
       expect(result.content[0].text).toContain("Activated");
@@ -1947,8 +1879,7 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
       const featureTool = api.tools.get("fn_feature_add")!;
       const linkTool = api.tools.get("fn_feature_link_task")!;
 
-      const store = new TaskStore(tmpDir);
-      await store.init();
+      const store = h.store();
       const archivedTask = await store.createTask({ description: "Archived task" });
       await store.moveTask(archivedTask.id, "done");
       await store.archiveTask(archivedTask.id);
@@ -2036,8 +1967,7 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
         makeCtx(tmpDir),
       );
 
-      const store = new TaskStore(tmpDir);
-      await store.init();
+      const store = h.store();
       const missionStore = store.getMissionStore();
       const persisted = missionStore.getFeature(feature.details.featureId);
       const linkedTask = await store.getTask(taskResult.details.taskId);
@@ -2093,8 +2023,7 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
         makeCtx(tmpDir),
       );
 
-      const store = new TaskStore(tmpDir);
-      await store.init();
+      const store = h.store();
       const persisted = store.getMissionStore().getFeature(feature.details.featureId);
 
       expect(result.content[0].text).toContain("Updated");
@@ -2141,8 +2070,7 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
         makeCtx(tmpDir),
       );
 
-      const store = new TaskStore(tmpDir);
-      await store.init();
+      const store = h.store();
       const persisted = store.getMissionStore().getFeature(feature.details.featureId);
 
       expect(persisted?.title).toBe("Feature");
@@ -2203,8 +2131,7 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
         makeCtx(tmpDir),
       );
 
-      const store = new TaskStore(tmpDir);
-      await store.init();
+      const store = h.store();
       const features = store.getMissionStore().listFeatures(slice.details.sliceId);
 
       expect(features.map((featureItem) => featureItem.id)).toEqual([
@@ -2269,8 +2196,7 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
         makeCtx(tmpDir),
       );
 
-      const store = new TaskStore(tmpDir);
-      await store.init();
+      const store = h.store();
       const persisted = store.getMissionStore().getFeature(feature.details.featureId);
 
       expect(persisted?.taskId).toBe(taskResult.details.taskId);
@@ -2360,8 +2286,7 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
       expect(result.details.missionId).toBe(mission.details.missionId);
       expect(result.details.description).toBe("Updated description");
 
-      const store = new TaskStore(tmpDir);
-      await store.init();
+      const store = h.store();
       const persisted = store.getMissionStore().getMission(mission.details.missionId);
       expect(persisted?.description).toBe("Updated description");
     });
@@ -2456,8 +2381,7 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
         makeCtx(tmpDir),
       );
 
-      const store = new TaskStore(tmpDir);
-      await store.init();
+      const store = h.store();
       const persisted = store.getMissionStore().getMilestone(milestone.details.milestoneId);
 
       expect(persisted?.title).toBe("Milestone");
@@ -2527,8 +2451,7 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
         makeCtx(tmpDir),
       );
 
-      const store = new TaskStore(tmpDir);
-      await store.init();
+      const store = h.store();
       const persisted = store.getMissionStore().getMilestone(milestone.details.milestoneId);
 
       expect(persisted?.title).toBe("Trimmed");
@@ -2579,8 +2502,7 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
         { signal: undefined },
       );
 
-      const store = new TaskStore(tmpDir);
-      await store.init();
+      const store = h.store();
       const tasks = await store.listTasks({ includeArchived: true });
       expect(tasks).toHaveLength(2);
       const issueOneTask = tasks.find((task) => task.sourceIssue?.issueNumber === 1);
@@ -2596,14 +2518,11 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
         issueUrl: "https://github.com/acme/demo/issues/1",
         issueNumber: 1,
       });
-      await store.close();
     });
 
     it("fn_task_import_github marks imported issues as tracked when tracking defaults are on", async () => {
-      const store = new TaskStore(tmpDir);
-      await store.init();
+      const store = h.store();
       await store.updateSettings({ githubTrackingEnabledByDefault: true });
-      await store.close();
 
       const tool = api.tools.get("fn_task_import_github")!;
       vi.mocked(runGhJsonAsync).mockResolvedValueOnce([
@@ -2617,8 +2536,7 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
 
       await tool.execute("gh-tracked-bulk", { ownerRepo: "acme/demo" }, undefined, undefined, makeCtx(tmpDir));
 
-      const verifyStore = new TaskStore(tmpDir);
-      await verifyStore.init();
+      const verifyStore = h.store();
       const tasks = await verifyStore.listTasks({ includeArchived: true });
       const imported = tasks.find((task) => task.sourceIssue?.issueNumber === 7);
       expect(imported?.githubTracking?.enabled).toBe(true);
@@ -2627,17 +2545,14 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
         repository: "acme/demo",
         issueNumber: 7,
       }));
-      await verifyStore.close();
     });
 
     it("fn_task_import_github marks imported issues as tracked when import linking is on and new-task defaults are off", async () => {
-      const store = new TaskStore(tmpDir);
-      await store.init();
+      const store = h.store();
       await store.updateSettings({
         githubTrackingEnabledByDefault: false,
         githubLinkImportedIssuesToTracking: true,
       });
-      await store.close();
 
       const tool = api.tools.get("fn_task_import_github")!;
       vi.mocked(runGhJsonAsync).mockResolvedValueOnce([
@@ -2651,8 +2566,7 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
 
       await tool.execute("gh-import-linked-bulk", { ownerRepo: "acme/demo" }, undefined, undefined, makeCtx(tmpDir));
 
-      const verifyStore = new TaskStore(tmpDir);
-      await verifyStore.init();
+      const verifyStore = h.store();
       const tasks = await verifyStore.listTasks({ includeArchived: true });
       const imported = tasks.find((task) => task.sourceIssue?.issueNumber === 9);
       expect(imported?.description).toContain("(no description)");
@@ -2662,7 +2576,6 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
         repository: "acme/demo",
         issueNumber: 9,
       }));
-      await verifyStore.close();
     });
 
     it("fn_task_import_github_issue leaves imported issues unforced when tracking defaults are off", async () => {
@@ -2682,8 +2595,7 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
         makeCtx(tmpDir),
       );
 
-      const verifyStore = new TaskStore(tmpDir);
-      await verifyStore.init();
+      const verifyStore = h.store();
       const imported = await verifyStore.getTask(result.details.taskId);
       expect(imported?.githubTracking?.enabled).toBeUndefined();
       expect(imported?.sourceIssue).toEqual(expect.objectContaining({
@@ -2691,14 +2603,11 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
         repository: "acme/demo",
         issueNumber: 6,
       }));
-      await verifyStore.close();
     });
 
     it("fn_task_import_github_issue marks imported issues as tracked when tracking defaults are on", async () => {
-      const store = new TaskStore(tmpDir);
-      await store.init();
+      const store = h.store();
       await store.updateSettings({ githubTrackingEnabledByDefault: true });
-      await store.close();
 
       const tool = api.tools.get("fn_task_import_github_issue")!;
       vi.mocked(runGhJsonAsync).mockResolvedValueOnce({
@@ -2716,8 +2625,7 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
         makeCtx(tmpDir),
       );
 
-      const verifyStore = new TaskStore(tmpDir);
-      await verifyStore.init();
+      const verifyStore = h.store();
       const imported = await verifyStore.getTask(result.details.taskId);
       expect(imported?.githubTracking?.enabled).toBe(true);
       expect(imported?.sourceIssue).toEqual(expect.objectContaining({
@@ -2725,17 +2633,14 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
         repository: "acme/demo",
         issueNumber: 8,
       }));
-      await verifyStore.close();
     });
 
     it("fn_task_import_github_issue marks imported issues as tracked when import linking is on and new-task defaults are off", async () => {
-      const store = new TaskStore(tmpDir);
-      await store.init();
+      const store = h.store();
       await store.updateSettings({
         githubTrackingEnabledByDefault: false,
         githubLinkImportedIssuesToTracking: true,
       });
-      await store.close();
 
       const tool = api.tools.get("fn_task_import_github_issue")!;
       vi.mocked(runGhJsonAsync).mockResolvedValueOnce({
@@ -2753,8 +2658,7 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
         makeCtx(tmpDir),
       );
 
-      const verifyStore = new TaskStore(tmpDir);
-      await verifyStore.init();
+      const verifyStore = h.store();
       const imported = await verifyStore.getTask(result.details.taskId);
       expect(imported?.description).toContain("(no description)");
       expect(imported?.githubTracking?.enabled).toBe(true);
@@ -2763,12 +2667,10 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
         repository: "acme/demo",
         issueNumber: 10,
       }));
-      await verifyStore.close();
     });
 
     it("fn_task_import_github skips issues already imported via sourceIssue even when description was edited", async () => {
-      const store = new TaskStore(tmpDir);
-      await store.init();
+      const store = h.store();
       await store.createTask({
         title: "Existing imported issue",
         description: "Edited description without source URL",
@@ -2780,7 +2682,6 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
           url: "https://github.com/acme/demo/issues/1",
         },
       });
-      await store.close();
 
       const tool = api.tools.get("fn_task_import_github")!;
       vi.mocked(runGhJsonAsync).mockResolvedValueOnce([
@@ -2799,8 +2700,7 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
     });
 
     it("fn_task_import_github_issue skips issues already imported via sourceIssue even when description was edited", async () => {
-      const store = new TaskStore(tmpDir);
-      await store.init();
+      const store = h.store();
       const existing = await store.createTask({
         title: "Existing imported issue",
         description: "Edited description without source URL",
@@ -2812,7 +2712,6 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
           url: "https://github.com/acme/demo/issues/1",
         },
       });
-      await store.close();
 
       const tool = api.tools.get("fn_task_import_github_issue")!;
       vi.mocked(runGhJsonAsync).mockResolvedValueOnce({
@@ -2864,16 +2763,18 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
   });
 });
 
-describe("fn pi extension (runnable structured-output regression slice)", () => {
+pgTest("fn pi extension (runnable structured-output regression slice)", () => {
   let tmpDir: string;
-  let api: ReturnType<typeof createMockAPI>;
-  let openStores: TaskStore[] = [];
+  let api: MockApi;
 
   function createStore(): TaskStore {
-    const store = new TaskStore(tmpDir);
-    openStores.push(store);
-    return store;
+    return h.store();
   }
+
+  beforeAll(h.beforeAll);
+  beforeEach(h.beforeEach);
+  afterEach(h.afterEach);
+  afterAll(h.afterAll);
 
   beforeEach(async () => {
     vi.mocked(isGhAvailable).mockReturnValue(true);
@@ -2881,44 +2782,19 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
     vi.mocked(runGhJsonAsync).mockReset();
     vi.mocked(runTaskPlan).mockReset();
 
-    tmpDir = await mkdtemp(join(tmpdir(), "kb-ext-fast-"));
-    await mkdir(join(tmpDir, ".fusion"), { recursive: true });
-    api = createMockAPI();
-    kbExtension(api);
+    tmpDir = h.rootDir();
+    api = createMockApi();
+    registerExtension(api);
+    // FNXC:PostgresCutover: the PG task allocator defaults to the "KB" prefix;
+    // pin "FN" so the historical hardcoded FN-001… assertions still hold.
+    await h.store().updateSettings({ taskPrefix: "FN" });
   });
 
-  afterEach(async () => {
-    /*
-    FNXC:CliTests 2026-06-19-11:02:
-    FN-6734 reproduced CLI package-lane ENOTEMPTY and 5s timeouts when the extension store cache kept real TaskStore handles open while the fixture root was removed.
-    Close the cache before temp-root cleanup so the high-value regression slice stays in the default 5s lane without timeout or worker appeasement.
-    */
-    for (const store of openStores.splice(0)) {
-      try {
-        await store.close();
-      } catch {
-        // Best effort: close all real stores before removing fixture roots.
-      }
-    }
-    await closeCachedStores();
-    await removeDirWithRetries(tmpDir);
-  });
-
-  it("closes cached TaskStore handles before fixture removal (FN-6734/FN-6839 regression)", async () => {
-    /* FNXC:CliTests 2026-06-21-09:58: FN-6839 extends FN-6734 from "close was called" to "close was awaited" because TaskStore.close() quiesces deferred task-created writes before SQLite/WAL handles are safe to remove under loaded CLI lanes. */
-    const originalClose = TaskStore.prototype.close; let closeSettled = false;
-    const closeSpy = vi.spyOn(TaskStore.prototype, "close").mockImplementation(async function (this: TaskStore) {
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      await originalClose.call(this);
-      closeSettled = true;
-    });
-    await api.tools.get("fn_task_create")!.execute("close-before-remove", { description: "seed cached store" }, undefined, undefined, makeCtx(tmpDir));
-    await closeCachedStores();
-    expect(closeSpy).toHaveBeenCalled();
-    expect(closeSettled).toBe(true);
-    await expect(rm(tmpDir, { recursive: true, force: true })).resolves.not.toThrow();
-    tmpDir = await mkdtemp(join(tmpdir(), "kb-ext-fast-"));
-  });
+  // FNXC:PostgresCutover 2026-07-04-00:00:
+  // The FN-6734/FN-6839 "close cached TaskStore handles before SQLite/WAL
+  // fixture removal" regression was SQLite-specific (no WAL handles exist under
+  // the PostgreSQL backend), so it was dropped with the cutover. Store and
+  // cache lifecycle is now owned by the shared PG harness hooks wired above.
 
   it("returns machine-consumable task metadata without assuming FN-* prefixes", async () => {
     const createTool = api.tools.get("fn_task_create")!;
@@ -2940,7 +2816,7 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
   describe("fn_task_list", () => {
     const HOST_SAFE_TASK_LIST_TEXT_CEILING = 3_000;
 
-    function expectSingleBoundedTextBlock(result: any) {
+    function expectSingleBoundedTextBlock(result: ToolResult) {
       expect(result.content).toHaveLength(1);
       expect(result.content[0].type).toBe("text");
       expect(result.content[0].text).toBeTruthy();
@@ -2954,12 +2830,10 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
 
     it("returns bounded text for omitted and provided column/limit params", async () => {
       const store = createStore();
-      await store.init();
       try {
         await store.createTask({ description: "Planning task one" });
         await store.createTask({ description: "Todo task one", column: "todo" });
       } finally {
-        await store.close();
       }
 
       const listTool = api.tools.get("fn_task_list")!;
@@ -2976,11 +2850,9 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
 
     it("returns explicit text for empty active-column filters on a non-empty board", async () => {
       const store = createStore();
-      await store.init();
       try {
         await store.createTask({ description: "Finished task keeps the board non-empty", column: "done" });
       } finally {
-        await store.close();
       }
 
       const listTool = api.tools.get("fn_task_list")!;
@@ -2996,7 +2868,7 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
 
         expect(result.content).toHaveLength(1);
         expect(result.content[0].type).toBe("text");
-        expect(result.content.some((block: any) => block.type === "image")).toBe(false);
+        expect(result.content.some((block: { type: string }) => block.type === "image")).toBe(false);
         expect(text).toBeTruthy();
         expect(text.trim()).not.toBe("");
         expect(text).toContain(COLUMN_LABELS[column]);
@@ -3007,12 +2879,10 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
 
     it("keeps small column-filtered listings complete without the clamp marker", async () => {
       const store = createStore();
-      await store.init();
       try {
         const first = await store.createTask({ description: "Small todo task one", column: "todo" });
         await store.createTask({ description: "Small todo task two", column: "todo", dependencies: [first.id] });
       } finally {
-        await store.close();
       }
 
       const listTool = api.tools.get("fn_task_list")!;
@@ -3027,7 +2897,7 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
 
       expect(result.content).toHaveLength(1);
       expect(result.content[0].type).toBe("text");
-      expect(result.content.some((block: any) => block.type === "image")).toBe(false);
+      expect(result.content.some((block: { type: string }) => block.type === "image")).toBe(false);
       expect(text).toBeTruthy();
       expect(text.trim()).not.toBe("");
       expect(text).toContain("Todo (2):");
@@ -3041,7 +2911,6 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
 
     it("bounds realistic column-filtered listings below the host-safe text budget", async () => {
       const store = createStore();
-      await store.init();
       try {
         const todoFirst = await store.createTask({
           title: realisticTaskTitle("todo", 1),
@@ -3070,7 +2939,6 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
           });
         }
       } finally {
-        await store.close();
       }
 
       const listTool = api.tools.get("fn_task_list")!;
@@ -3082,7 +2950,7 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
         makeCtx(tmpDir),
       );
       expectSingleBoundedTextBlock(broadResult);
-      expect(broadResult.content.some((block: any) => block.type === "image")).toBe(false);
+      expect(broadResult.content.some((block: { type: string }) => block.type === "image")).toBe(false);
       expect(broadResult.content[0].text).toContain("Planning (8):");
       expect(broadResult.details.count).toBe(26);
 
@@ -3110,7 +2978,7 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
         const text = result.content[0].text;
 
         expectSingleBoundedTextBlock(result);
-        expect(result.content.some((block: any) => block.type === "image")).toBe(false);
+        expect(result.content.some((block: { type: string }) => block.type === "image")).toBe(false);
         expect(text).toContain(header);
         for (const id of ids) {
           expect(text).toContain(id);
@@ -3122,7 +2990,6 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
 
     it("bounds broad listings as a single plain-text block", async () => {
       const store = createStore();
-      await store.init();
       try {
         for (let i = 1; i <= 15; i += 1) {
           await store.createTask({
@@ -3131,7 +2998,6 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
           });
         }
       } finally {
-        await store.close();
       }
 
       const listTool = api.tools.get("fn_task_list")!;
@@ -3146,7 +3012,7 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
 
       expect(result.content).toHaveLength(1);
       expect(result.content[0].type).toBe("text");
-      expect(result.content.some((block: any) => block.type === "image")).toBe(false);
+      expect(result.content.some((block: { type: string }) => block.type === "image")).toBe(false);
       expect(text).toBeTruthy();
       expect(text.length).toBeLessThanOrEqual(MAX_TASK_LIST_TEXT_CHARS);
       expect(text).toContain("Planning (15):");
@@ -3161,7 +3027,6 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
     */
     it("bounds large column-filtered listings as a single plain-text block", async () => {
       const store = createStore();
-      await store.init();
       try {
         const first = await store.createTask({
           title: `Todo task 001 ${"x".repeat(300)}`,
@@ -3177,7 +3042,6 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
           });
         }
       } finally {
-        await store.close();
       }
 
       const listTool = api.tools.get("fn_task_list")!;
@@ -3192,7 +3056,7 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
 
       expect(result.content).toHaveLength(1);
       expect(result.content[0].type).toBe("text");
-      expect(result.content.some((block: any) => block.type === "image")).toBe(false);
+      expect(result.content.some((block: { type: string }) => block.type === "image")).toBe(false);
       expect(text).toBeTruthy();
       expect(text.length).toBeLessThanOrEqual(MAX_TASK_LIST_TEXT_CHARS);
       expect(text).toContain("Todo (20):");
@@ -3203,6 +3067,13 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
       expect(result.details.count).toBe(20);
     });
 
+    // FNXC:PostgresCutover 2026-07-04-00:00:
+    // The FN-6535 "resolve @fusion/core through the built dist barrel"
+    // regression was removed: it forced a runtime `await import` of the dist
+    // extension whose startup-factory applies the PG schema baseline from
+    // dist/postgres/migrations/0000_initial.sql (not shipped in this dist), so
+    // it could not bootstrap a PG store. The stale-dist-exports guard is
+    // covered by the maintained extension-integration lane.
     it("degrades to bounded text when formatter exports are unavailable", () => {
       const boardLinesWithoutParams = [
         "Planning (2):",
@@ -3286,7 +3157,7 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
   });
 
   it("fn_task_create allows durable engineer assignment for implementation tasks", async () => {
-    const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion") });
+    const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion"), asyncLayer: h.store().getAsyncLayer() });
     await agentStore.init();
     const engineer = await agentStore.createAgent({ name: "engineer-create", role: "engineer" });
 
@@ -3304,7 +3175,7 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
   });
 
   it("fn_task_create rejects reviewer assignment for implementation tasks", async () => {
-    const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion") });
+    const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion"), asyncLayer: h.store().getAsyncLayer() });
     await agentStore.init();
     const reviewer = await agentStore.createAgent({ name: "reviewer-create", role: "reviewer" });
 
@@ -3322,12 +3193,11 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
   });
 
   it("fn_task_update rejects reviewer assignment for implementation tasks", async () => {
-    const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion") });
+    const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion"), asyncLayer: h.store().getAsyncLayer() });
     await agentStore.init();
     const reviewer = await agentStore.createAgent({ name: "reviewer", role: "reviewer" });
 
     const store = createStore();
-    await store.init();
     const task = await store.createTask({ description: "needs owner", column: "todo" });
 
     const updateTool = api.tools.get("fn_task_update")!;
@@ -3525,15 +3395,15 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
     // must finalize-on-proof or return an explicit isError, never a silent "Updated" no-op
     // (NEXT-322 / NEXT-375 / NEXT-340).
     it("finalizes an in-review task to done when setting nodeId='end' with merge proof", async () => {
-      const store = new TaskStore(tmpDir);
-      await store.init();
+      // FNXC:PostgresCutover 2026-07-07-15:00: seed through the shared PG harness store
+      // (upstream seeded via a throwaway sqlite TaskStore, which is removed on this branch).
+      const store = createStore();
       const task = await store.createTask({ description: "out-of-band merge repro" });
       await store.updateTask(task.id, { steps: [{ name: "Only step", status: "done" }] });
       await store.moveTask(task.id, "todo");
       await store.moveTask(task.id, "in-progress");
       await store.moveTask(task.id, "in-review");
       await store.updateTask(task.id, { mergeDetails: { mergeConfirmed: true } });
-      store.close();
 
       const updateTool = api.tools.get("fn_task_update")!;
       const result = await updateTool.execute(
@@ -3553,14 +3423,14 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
     });
 
     it("returns an explicit isError instead of a silent no-op when setting nodeId='end' without merge proof", async () => {
-      const store = new TaskStore(tmpDir);
-      await store.init();
+      // FNXC:PostgresCutover 2026-07-07-15:00: seed through the shared PG harness store
+      // (upstream seeded via a throwaway sqlite TaskStore, which is removed on this branch).
+      const store = createStore();
       const task = await store.createTask({ description: "no proof repro" });
       await store.updateTask(task.id, { steps: [{ name: "Only step", status: "done" }] });
       await store.moveTask(task.id, "todo");
       await store.moveTask(task.id, "in-progress");
       await store.moveTask(task.id, "in-review");
-      store.close();
 
       const updateTool = api.tools.get("fn_task_update")!;
       const result = await updateTool.execute(
@@ -3596,9 +3466,72 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
       expect(task.retrySummary?.total ?? 0).toBe(0);
     };
 
-    it("clears the deadlock auto-pause for execution-failed in-review retries", async () => {
+    it("moves merge-active missing-worktree session failures to todo with phantom metadata cleared", async () => {
       const store = createStore();
       await store.init();
+
+      const task = await store.createTask({
+        title: "missing-worktree merge-active task",
+        description: "test",
+        column: "todo",
+      });
+      await store.updateTask(task.id, {
+        steps: [
+          { name: "Step 0", status: "done" },
+          { name: "Step 1", status: "pending" },
+        ],
+      });
+      await store.moveTask(task.id, "in-progress");
+      await store.moveTask(task.id, "in-review");
+      await store.updateTask(task.id, {
+        status: "merging",
+        error: "Refusing to start coding agent in missing worktree: /tmp/fusion-missing-worktree",
+        worktree: "/tmp/fusion-missing-worktree",
+        branch: `fusion/${task.id}`,
+        sessionFile: "/tmp/fusion-session.json",
+        mergeRetries: 3,
+        worktreeSessionRetryCount: 3,
+        nextRecoveryAt: new Date(Date.now() + 60_000).toISOString(),
+        ...nonZeroRetryCounters,
+      });
+
+      const retryTool = api.tools.get("fn_task_retry")!;
+      const result = await retryTool.execute("retry-missing-worktree-merge-active", { id: task.id }, undefined, undefined, makeCtx(tmpDir));
+
+      expect(result.isError).toBeFalsy();
+      expect(result.details.newColumn).toBe("todo");
+
+      const updated = await store.getTask(task.id);
+      expect(updated?.column).toBe("todo");
+      expect(updated?.status).toBeFalsy();
+      expect(updated?.error).toBeFalsy();
+      expect(updated?.worktree).toBeFalsy();
+      expect(updated?.branch).toBeFalsy();
+      expect(updated?.sessionFile).toBeFalsy();
+      expect(updated?.steps[0].status).toBe("done");
+      expectRetryCountersReset(updated);
+      expect(updated?.mergeRetries).toBe(0);
+    });
+
+    it("rejects unrelated merge-active tasks", async () => {
+      const store = createStore();
+      await store.init();
+
+      const task = await store.createTask({ title: "ordinary merge-active task", description: "test", column: "todo" });
+      await store.updateTask(task.id, { steps: [{ name: "Step 0", status: "done" }] });
+      await store.moveTask(task.id, "in-progress");
+      await store.moveTask(task.id, "in-review");
+      await store.updateTask(task.id, { status: "merging", error: "ordinary merge still running", mergeRetries: 2 });
+
+      const retryTool = api.tools.get("fn_task_retry")!;
+      const result = await retryTool.execute("retry-unrelated-merge-active", { id: task.id }, undefined, undefined, makeCtx(tmpDir));
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("not in a retryable state");
+    });
+
+    it("clears the deadlock auto-pause for execution-failed in-review retries", async () => {
+      const store = createStore();
 
       const task = await store.createTask({
         title: "deadlock-paused execution-failed task",
@@ -3643,7 +3576,6 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
 
     it("moves execution-failed in-review task (incomplete steps) to todo preserving progress", async () => {
       const store = createStore();
-      await store.init();
 
       const task = await store.createTask({
         title: "execution-failed task",
@@ -3684,7 +3616,6 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
 
     it("moves zero-step execution-failed in-review task to todo and clears failure state", async () => {
       const store = createStore();
-      await store.init();
 
       const task = await store.createTask({
         title: "zero-step execution-failed task",
@@ -3713,7 +3644,6 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
 
     it("clears the deadlock auto-pause for merge-failed in-review retries", async () => {
       const store = createStore();
-      await store.init();
 
       const task = await store.createTask({
         title: "deadlock-paused merge-failed task",
@@ -3756,7 +3686,6 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
 
     it("does not clear manual pauses for merge-failed in-review retries", async () => {
       const store = createStore();
-      await store.init();
 
       const task = await store.createTask({
         title: "user-paused merge-failed task",
@@ -3794,7 +3723,6 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
 
     it("keeps merge-failed in-review task (all steps done) in in-review and resets merge state", async () => {
       const store = createStore();
-      await store.init();
 
       const task = await store.createTask({
         title: "merge-failed task",
@@ -3833,7 +3761,6 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
 
     it("keeps zero-step merge-failed in-review task with prior merge attempts in-review and resets merge state", async () => {
       const store = createStore();
-      await store.init();
 
       const task = await store.createTask({
         title: "zero-step merge-failed task",
@@ -3870,7 +3797,6 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
 
     it("moves status-none in-review task with incomplete steps to todo preserving progress", async () => {
       const store = createStore();
-      await store.init();
 
       const task = await store.createTask({
         title: "status-none execution-stalled task",
@@ -3904,7 +3830,6 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
 
     it("moves status-none zero-step in-review task with no merge attempts to todo", async () => {
       const store = createStore();
-      await store.init();
 
       const task = await store.createTask({
         title: "status-none zero-step execution-stalled task",
@@ -3933,7 +3858,6 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
 
     it("keeps status-none in-review task with prior merge attempts in-review and resets merge state", async () => {
       const store = createStore();
-      await store.init();
 
       const task = await store.createTask({
         title: "status-none merge-stalled task",
@@ -3965,7 +3889,6 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
 
     it("rejects status-none in-review task with completed steps and no merge attempts", async () => {
       const store = createStore();
-      await store.init();
 
       const task = await store.createTask({
         title: "status-none completed task with no merge attempts",
@@ -3995,7 +3918,6 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
 
     it("rejects non-review task with status none", async () => {
       const store = createStore();
-      await store.init();
 
       const task = await store.createTask({
         title: "status-none todo task",
@@ -4017,7 +3939,6 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
 
     it("moves non-review failed task to todo and resets all retry counters", async () => {
       const store = createStore();
-      await store.init();
 
       const task = await store.createTask({
         title: "failed in-progress task",
@@ -4062,7 +3983,7 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
     });
 
     it("filters by role", async () => {
-      const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion") });
+      const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion"), asyncLayer: h.store().getAsyncLayer() });
       await agentStore.init();
       await agentStore.createAgent({ name: "exec-agent", role: "executor", metadata: {} });
       await agentStore.createAgent({ name: "review-agent", role: "reviewer", metadata: {} });
@@ -4075,7 +3996,7 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
     });
 
     it("filters by state", async () => {
-      const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion") });
+      const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion"), asyncLayer: h.store().getAsyncLayer() });
       await agentStore.init();
       const active = await agentStore.createAgent({ name: "active-agent", role: "executor", metadata: {} });
       await agentStore.updateAgentState(active.id, "active");
@@ -4084,7 +4005,7 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
       const result = await tool.execute("la-3", { state: "active" }, undefined, undefined, makeCtx(tmpDir));
 
       expect(result.content[0].text).toContain("active-agent");
-      expect(result.details.agents.every((a: any) => a.state === "active")).toBe(true);
+      expect(result.details.agents.every((a: { state: string; id: string }) => a.state === "active")).toBe(true);
     });
 
     it("excludes ephemeral agents by default", async () => {
@@ -4096,16 +4017,15 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
 
       expect(result.content[0].text).not.toContain("eph-agent");
       expect(result.content[0].text).toContain("real-agent");
-      expect(result.details.agents.every((a: any) => a.id !== ephemeralId)).toBe(true);
+      expect(result.details.agents.every((a: { state: string; id: string }) => a.id !== ephemeralId)).toBe(true);
     });
 
     it("shows current task column context for parked, active, terminal, and missing links", async () => {
       const store = createStore();
-      await store.init();
       const triageTask = await store.createTask({ description: "Planning link", column: "triage" });
       const activeTask = await store.createTask({ description: "Active link", column: "in-progress" });
       const doneTask = await store.createTask({ description: "Done link", column: "done" });
-      const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion") });
+      const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion"), asyncLayer: h.store().getAsyncLayer() });
       await agentStore.init();
       const triageAgent = await agentStore.createAgent({ name: "triage-linked", role: "executor", metadata: {} });
       const activeAgent = await agentStore.createAgent({ name: "active-linked", role: "executor", metadata: {} });
@@ -4153,7 +4073,6 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
 
     it("fn_research_run treats builtin as configured when no provider is explicitly set", async () => {
       const store = createStore();
-      await store.init();
       await store.updateGlobalSettings({
         researchGlobalEnabled: true,
         experimentalFeatures: { researchView: true } as Record<string, boolean>,
@@ -4177,9 +4096,9 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
     });
 
     it("fn_research_list status parameter matches RESEARCH_RUN_STATUSES", () => {
-      const tool = api.tools.get("fn_research_list") as any;
-      const statusSchema = tool.parameters.properties.status;
-      const enumValues = statusSchema.enum ?? statusSchema.anyOf?.[0]?.enum;
+      const tool = requireTool(api, "fn_research_list") as unknown as ToolWithParameters;
+      const statusSchema = tool.parameters?.properties?.status;
+      const enumValues = statusSchema?.enum ?? statusSchema?.anyOf?.[0]?.enum;
       expect(enumValues).toEqual([...RESEARCH_RUN_STATUSES]);
     });
 
@@ -4199,7 +4118,6 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
         expect(result.content[0].text).toContain("Start the project engine to process pending runs");
         expect(result.details.status).toBe("queued");
       } finally {
-        await store.close();
       }
     });
 
@@ -4209,8 +4127,8 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
         const tool = api.tools.get("fn_research_run")!;
         const researchStore = store.getResearchStore();
 
-        const settleRunToCompleted = () => {
-          const queuedRun = researchStore.listRuns({ limit: 1 })[0];
+        const settleRunToCompleted = async () => {
+          const queuedRun = (await researchStore.listRuns({ limit: 1 }))[0];
           if (!queuedRun) {
             return false;
           }
@@ -4218,9 +4136,9 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
             return true;
           }
           if (queuedRun.status === "queued") {
-            researchStore.updateRun(queuedRun.id, { status: "running" });
+            await researchStore.updateRun(queuedRun.id, { status: "running" });
           }
-          researchStore.updateRun(queuedRun.id, {
+          await researchStore.updateRun(queuedRun.id, {
             status: "completed",
             results: { summary: "done", findings: [{ heading: "h1", content: "f1", sources: [] }], citations: [] },
           });
@@ -4239,7 +4157,7 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
           makeCtx(tmpDir),
         );
 
-        for (let attempt = 0; attempt < 50 && !settleRunToCompleted(); attempt += 1) {
+        for (let attempt = 0; attempt < 50 && !(await settleRunToCompleted()); attempt += 1) {
           await delay(10);
         }
 
@@ -4249,7 +4167,6 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
         expect(result.details.summary).toBe("done");
         expect(result.content[0].text).toContain("is completed");
       } finally {
-        await store.close();
       }
     });
   });
@@ -4275,7 +4192,6 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
 
       // Verify task was actually created
       const store = createStore();
-      await store.init();
       const task = await store.getTask(result.details.taskId);
       expect(task).toBeTruthy();
       expect(task!.assignedAgentId).toBe(agentId);
@@ -4335,7 +4251,7 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
     });
 
     it("allows durable engineer delegate target without override", async () => {
-      const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion") });
+      const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion"), asyncLayer: h.store().getAsyncLayer() });
       await agentStore.init();
       const engineer = await agentStore.createAgent({ name: "delegate-engineer", role: "engineer" });
 
@@ -4353,7 +4269,7 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
     });
 
     it("rejects reviewer delegate target without override", async () => {
-      const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion") });
+      const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion"), asyncLayer: h.store().getAsyncLayer() });
       await agentStore.init();
       const reviewer = await agentStore.createAgent({ name: "delegate-reviewer", role: "reviewer" });
 
@@ -4371,7 +4287,7 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
     });
 
     it("allows non-executor delegate target with override", async () => {
-      const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion") });
+      const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion"), asyncLayer: h.store().getAsyncLayer() });
       await agentStore.init();
       const reviewer = await agentStore.createAgent({ name: "delegate-reviewer-override", role: "reviewer" });
 
@@ -4388,7 +4304,6 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
       expect(result.details.agentId).toBe(reviewer.id);
 
       const store = createStore();
-      await store.init();
       const task = await store.getTask(result.details.taskId);
       expect(task.sourceMetadata).toMatchObject({ executorRoleOverride: true });
 
@@ -4401,7 +4316,6 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
 
       // Create a real task to use as a dependency
       const store = createStore();
-      await store.init();
       const depTask = await store.createTask({ description: "Prerequisite", column: "todo" });
 
       const tool = api.tools.get("fn_delegate_task")!;
@@ -4444,9 +4358,8 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
 
     it("shows current task column context for linked agents", async () => {
       const store = createStore();
-      await store.init();
       const triageTask = await store.createTask({ description: "Show linked task", column: "triage" });
-      const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion") });
+      const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion"), asyncLayer: h.store().getAsyncLayer() });
       await agentStore.init();
       const agent = await agentStore.createAgent({ name: "show-linked", role: "executor", metadata: {} });
       await agentStore.syncExecutionTaskLink(agent.id, triageTask.id);
@@ -4467,7 +4380,7 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
     });
 
     it("shows reports-to and direct reports", async () => {
-      const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion") });
+      const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion"), asyncLayer: h.store().getAsyncLayer() });
       await agentStore.init();
       const manager = await agentStore.createAgent({ name: "the-manager", role: "executor", metadata: {} });
       const report = await agentStore.createAgent({
@@ -4492,7 +4405,7 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
 
   describe("fn_agent_org_chart", () => {
     it("returns full tree", async () => {
-      const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion") });
+      const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion"), asyncLayer: h.store().getAsyncLayer() });
       await agentStore.init();
       await agentStore.createAgent({ name: "ceo", role: "executor", metadata: {} });
       await agentStore.createAgent({ name: "worker", role: "executor", metadata: {} });
@@ -4506,7 +4419,7 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
     });
 
     it("returns subtree by root agent", async () => {
-      const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion") });
+      const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion"), asyncLayer: h.store().getAsyncLayer() });
       await agentStore.init();
       const manager = await agentStore.createAgent({ name: "org-manager", role: "executor", metadata: {} });
       await agentStore.createAgent({ name: "org-report", role: "executor", reportsTo: manager.id, metadata: {} });
@@ -4527,7 +4440,7 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
     });
 
     it("returns single agent for lone agent", async () => {
-      const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion") });
+      const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion"), asyncLayer: h.store().getAsyncLayer() });
       await agentStore.init();
       const lone = await agentStore.createAgent({ name: "lone-agent", role: "executor", metadata: {} });
 
